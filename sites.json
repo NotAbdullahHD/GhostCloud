@@ -1,0 +1,16 @@
+{
+  "sites": {
+    "localhost": {
+      "api_key": "sk_live_local_dev_key_12345",
+      "enabled": true,
+      "max_concurrent_sessions": 5,
+      "max_session_seconds": 900,
+      "limits": {
+        "per_minute": 60,
+        "per_hour": 3600,
+        "per_day": 86400,
+        "per_month": 2592000
+      }
+    }
+  }
+}

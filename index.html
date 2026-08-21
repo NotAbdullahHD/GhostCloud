@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GhostCloud — Cloud Game Library</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+  <!-- ====== HEADER ====== -->
+  <header class="site-header">
+    <div class="header-inner">
+      <a href="#" class="logo" aria-label="GhostCloud home">
+        <span class="logo-icon">☁</span>
+        <span class="logo-text">GhostCloud</span>
+        <span class="logo-sub">Games</span>
+      </a>
+
+      <div class="search-box">
+        <i class="fas fa-search search-icon" aria-hidden="true"></i>
+        <input type="text" id="search-input" class="search-input" placeholder="Search 225 games…" autocomplete="off">
+        <button class="search-clear hidden" id="search-clear" aria-label="Clear search">&times;</button>
+      </div>
+
+      <div class="header-actions">
+        <div class="api-status" id="api-status" title="API status">
+          <span class="status-dot" id="status-dot"></span>
+          <span class="status-label" id="status-label">API</span>
+        </div>
+        <button class="btn-icon" id="settings-btn" aria-label="Settings" title="Settings">
+          <i class="fas fa-cog"></i>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- ====== MAIN CONTENT ====== -->
+  <main class="main-content">
+    <!-- Loading -->
+    <div class="loading-state" id="loading-state">
+      <div class="spinner"></div>
+      <p>Loading game catalog…</p>
+    </div>
+
+    <!-- Error -->
+    <div class="error-state hidden" id="error-state">
+      <i class="fas fa-exclamation-triangle"></i>
+      <h2>Could not load games</h2>
+      <p id="error-msg"></p>
+      <button class="btn" onclick="location.reload()">Retry</button>
+    </div>
+
+    <!-- Hero -->
+    <section class="hero hidden" id="hero">
+      <div class="hero-bg" id="hero-bg"></div>
+      <div class="hero-gradient"></div>
+      <div class="hero-info">
+        <div class="hero-tags" id="hero-tags"></div>
+        <h1 class="hero-title" id="hero-title"></h1>
+        <p class="hero-desc" id="hero-desc"></p>
+        <button class="btn btn-play" id="hero-play" aria-label="Play game">
+          <i class="fas fa-play"></i> Play Now
+        </button>
+      </div>
+    </section>
+
+    <!-- Filters -->
+    <section class="filters hidden" id="filters">
+      <div class="filter-chips" id="filter-chips">
+        <button class="chip active" data-tag="all">All</button>
+      </div>
+      <span class="result-count" id="result-count"></span>
+    </section>
+
+    <!-- Game Grid -->
+    <section class="game-grid hidden" id="game-grid">
+      <div class="grid-empty hidden" id="grid-empty">
+        <i class="fas fa-search"></i>
+        <p>No games match your search</p>
+      </div>
+    </section>
+  </main>
+
+  <!-- ====== GAME DETAIL MODAL ====== -->
+  <div class="modal-overlay hidden" id="detail-modal">
+    <div class="modal" role="dialog" aria-modal="true">
+      <button class="modal-close" aria-label="Close">&times;</button>
+      <div class="detail-layout">
+        <div class="detail-cover">
+          <img id="detail-cover" alt="" src="">
+        </div>
+        <div class="detail-info">
+          <h2 id="detail-name"></h2>
+          <div class="detail-tags" id="detail-tags"></div>
+          <p class="detail-desc" id="detail-desc"></p>
+          <button class="btn btn-play" id="detail-play">
+            <i class="fas fa-play"></i> Play Now
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== PLAYER MODAL ====== -->
+  <div class="modal-overlay hidden" id="player-modal">
+    <div class="player-container" role="dialog" aria-modal="true">
+      <div class="player-bar">
+        <span class="player-title" id="player-title">Launching…</span>
+        <div class="player-actions">
+          <button class="btn-icon" id="player-fullscreen" aria-label="Fullscreen" title="Fullscreen">
+            <i class="fas fa-expand"></i>
+          </button>
+          <button class="btn-icon btn-close" id="player-close" aria-label="Quit" title="Quit">
+            <i class="fas fa-times"></i>
+          </button>
+        </div>
+      </div>
+
+      <!-- Status overlay -->
+      <div class="player-status" id="player-status">
+        <div class="player-status-inner">
+          <div class="player-spinner" id="player-spinner"></div>
+          <h3 id="player-status-title">Connecting</h3>
+          <p id="player-status-msg">Creating session…</p>
+          <div class="player-steps" id="player-steps">
+            <div class="step active" data-step="session">Create session</div>
+            <div class="step" data-step="queue">Queue</div>
+            <div class="step" data-step="start">Start game</div>
+            <div class="step" data-step="connect">Connect stream</div>
+          </div>
+          <button class="btn btn-danger hidden" id="player-cancel">Cancel</button>
+        </div>
+      </div>
+
+      <!-- Video element -->
+      <video id="player-video" class="player-video" autoplay playsinline></video>
+    </div>
+  </div>
+
+  <!-- ====== SETTINGS MODAL ====== -->
+  <div class="modal-overlay hidden" id="settings-modal">
+    <div class="modal modal-sm" role="dialog" aria-modal="true">
+      <button class="modal-close" aria-label="Close">&times;</button>
+      <h2>Settings</h2>
+      <form id="settings-form" class="settings-form">
+        <label>
+          <span>API Base URL</span>
+          <input type="url" id="setting-api-base" placeholder="http://localhost:3001">
+        </label>
+        <label>
+          <span>API Key</span>
+          <input type="text" id="setting-api-key" placeholder="test-api-key-123">
+        </label>
+        <div class="settings-actions">
+          <button type="button" class="btn btn-ghost" id="settings-test">Test Connection</button>
+          <button type="submit" class="btn">Save</button>
+        </div>
+        <p class="settings-hint" id="settings-test-result"></p>
+
+        <div class="settings-section">
+          <h3>Raccoon account <span class="settings-tag">manual</span></h3>
+          <p class="settings-hint">Register a Raccoon account with your own mailbox (any temp-mail site works). The launcher will use this instead of auto-generating one.</p>
+          <label>
+            <span>Email</span>
+            <div class="code-row">
+              <input type="email" id="manual-email" placeholder="you@example.com" autocomplete="off">
+              <button type="button" class="btn btn-ghost" id="manual-mailbox">Get temp mailbox</button>
+            </div>
+          </label>
+          <label>
+            <span>Password</span>
+            <input type="text" id="manual-password" placeholder="Choose a password" autocomplete="off">
+          </label>
+          <div class="settings-row">
+            <label>
+              <span>Phone</span>
+              <input type="text" id="manual-phone" placeholder="1" autocomplete="off">
+            </label>
+            <label>
+              <span>Country</span>
+              <input type="text" id="manual-country" placeholder="Brazil" autocomplete="off">
+            </label>
+          </div>
+          <label>
+            <span>Verification code</span>
+            <div class="code-row">
+              <input type="text" id="manual-code" placeholder="6-digit code" autocomplete="off">
+              <button type="button" class="btn btn-ghost" id="manual-send">Send code</button>
+            </div>
+          </label>
+          <div class="settings-actions">
+            <button type="button" class="btn" id="manual-register">Register &amp; save</button>
+            <button type="button" class="btn btn-ghost" id="manual-clear">Clear</button>
+          </div>
+          <p class="settings-hint" id="manual-status"></p>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ====== TOAST ====== -->
+  <div class="toast hidden" id="toast" aria-live="polite"></div>
+
+  <script src="js/app.js"></script>
+</body>
+</html>
