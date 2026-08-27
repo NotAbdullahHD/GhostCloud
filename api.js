@@ -59,7 +59,8 @@ const siteUsage = new Map();
 const ipLimits = new Map();
 const embedIpLimits = new Map();
 const accountCreating = new Map();
-const MAX_SESSION_SECONDS = 19 * 60;
+// No app-side cutoff: sessions run until Raccoon's platform ends them, or the player quits.
+const MAX_SESSION_SECONDS = Number.MAX_SAFE_INTEGER; // effectively unlimited
 function decryptPayload(result) {
   const key = Buffer.from("fd39e724f7c1e4b3d34bc7c72b5349c3", "utf8");
   const iv = Buffer.from("dd39e4a3337fe25a", "utf8");
@@ -240,18 +241,37 @@ function connectRaccoonSignaling(session) {
 }
 function getClientIp(req) { return req.headers["x-caddy-real-ip-is-here1357908642"] || req.socket.remoteAddress || "unknown"; }
 function checkIpLimit(store, ip, windowMs, max) { const now = Date.now(); const hits = (store.get(ip) || []).filter((t) => t > now - windowMs); if (hits.length >= max) return false; hits.push(now); store.set(ip, hits); return true; }
+// Reject requests coming from websites that aren't in the site's allowlist.
+// This stops someone else from pointing their own site at your API even if
+// they steal the API base URL or key from your page source.
+function originAllowed(req, site) {
+  const origin = req.headers.origin;
+  if (!origin) return true; // non-browser clients (curl, server-to-server) with a valid key
+  const allowed = site.allowed_origins || [];
+  if (allowed.includes("*")) return true;
+  return allowed.includes(origin) || allowed.some((a) => origin.startsWith(a.replace(/\/+$/, "")));
+}
 function auth(req, res, next) {
   const apiKey = req.headers["x-api-key"] || req.body?.api_key || req.query?.api_key;
   if (!apiKey) return res.status(401).json({ error: "Missing API key." });
   const site = getSite(apiKey);
   if (!site) return res.status(401).json({ error: "Invalid API key." });
   if (!site.enabled) return res.status(403).json({ error: "API Key disabled." });
+  if (!originAllowed(req, site)) return res.status(403).json({ error: "Origin not allowed." });
   req.site = site; req.apiKey = apiKey; next();
 }
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
-app.use((req, res, next) => { const ip = getClientIp(req); if (!checkIpLimit(ipLimits, ip, 60000, 100)) { return res.status(429).json({ error: "Too many requests." }); } req.setTimeout(30000, () => { res.status(408).json({ error: "Timeout." }); }); next(); });
+app.use((req, res, next) => {
+  // Presence pings are tiny and many clients can share one NAT IP (schools), so skip the per-IP burst limit for them.
+  if (!req.path.startsWith("/cloud/v1/heartbeat") && !req.path.startsWith("/cloud/v1/online")) {
+    const ip = getClientIp(req);
+    if (!checkIpLimit(ipLimits, ip, 60000, 100)) return res.status(429).json({ error: "Too many requests." });
+  }
+  req.setTimeout(30000, () => { res.status(408).json({ error: "Timeout." }); });
+  next();
+});
 app.use(express.static(path.join(__dirname, "public")));
 // Health check for hosting platforms (Render/Railway) that require a 200 on /
 app.get("/healthz", (req, res) => res.json({ status: "ok", name: "ghostcloud-api" }));
@@ -263,6 +283,28 @@ app.get("/cloud/v1/embed-data", (req, res) => {
   const session = sessions.get(id); if (!session) return res.status(404).json({ error: "Not found." }); if (session.state !== "active") return res.status(400).json({ error: "Not active." });
   res.json({ ice_servers: session.embed_ice_servers, signaling_ws: session.embed_signaling_ws });
 });
+// ── Online presence (real live user count) ────────────────
+// Every browser sends a heartbeat ~every 30s with a stable client id
+// (stored in localStorage). Anyone not heard from in 70s is dropped.
+const presence = new Map(); // clientId -> lastSeen (ms)
+const PRESENCE_TTL_MS = 70 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, seen] of presence) if (now - seen > PRESENCE_TTL_MS) presence.delete(id);
+}, 15 * 1000);
+function onlineCount() {
+  const now = Date.now();
+  let n = 0;
+  for (const seen of presence.values()) if (now - seen <= PRESENCE_TTL_MS) n++;
+  return n;
+}
+app.post("/cloud/v1/heartbeat", auth, (req, res) => {
+  const id = (req.body || {}).client_id;
+  if (typeof id === "string" && id.length >= 8 && id.length <= 64) presence.set(id, Date.now());
+  res.json({ online: onlineCount() });
+});
+app.get("/cloud/v1/online", auth, (req, res) => res.json({ online: onlineCount() }));
+
 const REGISTER_HEADERS = { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Mozilla/5.0 Chrome/147.0.0.0 Safari/537.36" };
 function registerBase(sn) { return { sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web" }; }
 

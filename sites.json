@@ -3,8 +3,12 @@
     "localhost": {
       "api_key": "sk_live_local_dev_key_12345",
       "enabled": true,
+      "allowed_origins": [
+        "http://localhost:4578",
+        "https://ghostcloud.ghostos.workers.dev"
+      ],
       "max_concurrent_sessions": 5,
-      "max_session_seconds": 900,
+      "max_session_seconds": 0,
       "limits": {
         "per_minute": 60,
         "per_hour": 3600,
