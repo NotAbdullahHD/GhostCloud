@@ -59,8 +59,8 @@ const siteUsage = new Map();
 const ipLimits = new Map();
 const embedIpLimits = new Map();
 const accountCreating = new Map();
-// No app-side cutoff: sessions run until Raccoon's platform ends them, or the player quits.
-const MAX_SESSION_SECONDS = Number.MAX_SAFE_INTEGER; // effectively unlimited
+const MAX_SESSION_SECONDS = 19 * 60; // 19 min default session cap
+const DEFAULT_SESSION_SECONDS = 19 * 60;
 function decryptPayload(result) {
   const key = Buffer.from("fd39e724f7c1e4b3d34bc7c72b5349c3", "utf8");
   const iv = Buffer.from("dd39e4a3337fe25a", "utf8");
@@ -393,7 +393,7 @@ app.post("/cloud/v1/createSession", auth, async (req, res) => {
   res.flushHeaders();
   const push = (obj) => res.write(JSON.stringify(obj) + "\n");
   const uuid = randomUUID();
-  const rawLimit = site.max_session_seconds ?? MAX_SESSION_SECONDS;
+  const rawLimit = site.max_session_seconds && site.max_session_seconds > 0 ? site.max_session_seconds : DEFAULT_SESSION_SECONDS;
   const sessionLimit = Math.min(rawLimit, MAX_SESSION_SECONDS);
   const session = { uuid, api_key: apiKey, state: "creating", game_key, sn: "", token: "", created_at: Date.now(), max_session_seconds: sessionLimit, last_queue_poll_at: null, last_ping_at: null, startgame_timeout: null, queue_abandon_timeout: null, ping_timeout: null, session_timeout: null, raccoonWs: null, raccoonPingInterval: null, clientWs: null, costInterval: null };
   sessions.set(uuid, session);
@@ -457,10 +457,7 @@ app.post("/cloud/v1/startGame", auth, (req, res) => {
   clearTimeout(session.startgame_timeout); clearTimeout(session.queue_abandon_timeout);
   session.state = "active"; session.game_started_at = Date.now();
   resetPingTimeout(uuid);
-  // 0 / null max_session_seconds = no app-side cutoff; only arm a timer when it's a positive value
-  if (session.max_session_seconds > 0) {
-    session.session_timeout = setTimeout(() => killSession(uuid, "max_session_length"), session.max_session_seconds * 1000);
-  }
+  session.session_timeout = setTimeout(() => killSession(uuid, "max_session_length"), session.max_session_seconds * 1000);
   const iceServers = [{ urls: "stun:stun.l.google.com:19302" }, ...(session.turns || []).map((t) => ({ urls: t.turn_url, username: t.turn_user, credential: t.turn_password }))];
   const proto = req.headers["x-forwarded-proto"] || req.protocol;
   const signalingWs = `${proto === "https" ? "wss" : "ws"}://${req.headers.host}/cloud/v1/signal/${uuid}`;
