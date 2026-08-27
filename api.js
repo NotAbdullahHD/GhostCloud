@@ -216,7 +216,7 @@ function resetPingTimeout(uuid) { const session = sessions.get(uuid); if (!sessi
 const REAPER_DEADLINES = { creating: 5 * 60000, finished_queue: 2 * 60000 };
 const QUEUED_MAX_AGE = 30 * 60000;
 const QUEUED_POLL_STALE_AFTER = 90000;
-setInterval(() => { const now = Date.now(); for (const [uuid, session] of sessions) { if (session.state === "queued") { const lastSeen = session.last_queue_poll_at ?? session.created_at; if (now - lastSeen > QUEUED_POLL_STALE_AFTER || now - session.created_at > QUEUED_MAX_AGE) { killSession(uuid, "reaper:queued_stale"); } continue; } const deadline = REAPER_DEADLINES[session.state]; if (deadline !== undefined && now - session.created_at > deadline) { killSession(uuid, `reaper:${session.state}_deadline`); continue; } if (session.state === "active" && !session.session_timeout) { killSession(uuid, "reaper:active_no_timeout"); } } }, 2 * 60000);
+setInterval(() => { const now = Date.now(); for (const [uuid, session] of sessions) { if (session.state === "queued") { const lastSeen = session.last_queue_poll_at ?? session.created_at; if (now - lastSeen > QUEUED_POLL_STALE_AFTER || now - session.created_at > QUEUED_MAX_AGE) { killSession(uuid, "reaper:queued_stale"); } continue; } const deadline = REAPER_DEADLINES[session.state]; if (deadline !== undefined && now - session.created_at > deadline) { killSession(uuid, `reaper:${session.state}_deadline`); continue; } if (session.state === "active" && !session.session_timeout && session.max_session_seconds > 0) { killSession(uuid, "reaper:active_no_timeout"); } } }, 2 * 60000);
 function connectRaccoonSignaling(session) {
   const { sn, gl_key, play_config, uuid } = session;
   const raccoonWs = new WebSocket(session.message_server.url);
@@ -457,7 +457,10 @@ app.post("/cloud/v1/startGame", auth, (req, res) => {
   clearTimeout(session.startgame_timeout); clearTimeout(session.queue_abandon_timeout);
   session.state = "active"; session.game_started_at = Date.now();
   resetPingTimeout(uuid);
-  session.session_timeout = setTimeout(() => killSession(uuid, "max_session_length"), session.max_session_seconds * 1000);
+  // 0 / null max_session_seconds = no app-side cutoff; only arm a timer when it's a positive value
+  if (session.max_session_seconds > 0) {
+    session.session_timeout = setTimeout(() => killSession(uuid, "max_session_length"), session.max_session_seconds * 1000);
+  }
   const iceServers = [{ urls: "stun:stun.l.google.com:19302" }, ...(session.turns || []).map((t) => ({ urls: t.turn_url, username: t.turn_user, credential: t.turn_password }))];
   const proto = req.headers["x-forwarded-proto"] || req.protocol;
   const signalingWs = `${proto === "https" ? "wss" : "ws"}://${req.headers.host}/cloud/v1/signal/${uuid}`;
