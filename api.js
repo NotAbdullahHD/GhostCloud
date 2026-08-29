@@ -1,5 +1,5 @@
 const express = require("express");
-const { randomUUID, createDecipheriv } = require("crypto");
+const { randomUUID, createDecipheriv, createHash } = require("crypto");
 const { readFileSync } = require("fs");
 const { WebSocketServer, WebSocket } = require("ws");
 const { createServer } = require("http");
@@ -304,6 +304,44 @@ app.post("/cloud/v1/heartbeat", auth, (req, res) => {
   res.json({ online: onlineCount() });
 });
 app.get("/cloud/v1/online", auth, (req, res) => res.json({ online: onlineCount() }));
+
+// ── Pro entitlements (server-validated) ────────────────────
+// The Pro code never ships to the browser; the client sends it here once and the
+// API validates it, then issues a signed entitlement token that grants Pro.
+const PRO_CODE_HASH = "f3f8b1ec69ffdd8ad2571814296e513d2e5b6767ecde5ce576b53441d6929451";
+const PRO_DAILY_SECONDS = 8 * 3600; // 8h/day for Pro
+const proTokens = new Map(); // token -> expiresAt (ms)
+const proAttempts = new Map(); // ip -> timestamps (brute-force guard on code entry)
+function proTokenNew() { return randomUUID().replace(/-/g, "") + randomUUID().replace(/-/g, ""); }
+setInterval(() => {
+  const now = Date.now();
+  for (const [t, exp] of proTokens) if (now > exp) proTokens.delete(t);
+  for (const [ip, arr] of proAttempts) proAttempts.set(ip, arr.filter((x) => x > now - 60000));
+}, 60 * 1000);
+app.post("/cloud/v1/activatePro", auth, (req, res) => {
+  const ip = getClientIp(req);
+  const now = Date.now();
+  const attempts = (proAttempts.get(ip) || []).filter((x) => x > now - 60000);
+  if (attempts.length >= 5) return res.status(429).json({ error: "Too many attempts. Try again later." });
+  proAttempts.set(ip, [...attempts, now]);
+  const code = String((req.body || {}).code || "").trim();
+  if (!code || createHash("sha256").update(code).digest("hex") !== PRO_CODE_HASH) {
+    return res.status(401).json({ error: "Invalid code." });
+  }
+  const token = proTokenNew();
+  proTokens.set(token, Date.now() + 30 * 24 * 3600 * 1000); // 30-day token (sliding)
+  res.json({ ok: true, token, subDailySeconds: PRO_DAILY_SECONDS });
+});
+app.post("/cloud/v1/verifyPro", auth, (req, res) => {
+  const token = String((req.body || {}).token || "");
+  const exp = proTokens.get(token);
+  if (!token || !exp || Date.now() > exp) {
+    if (token) proTokens.delete(token);
+    return res.json({ active: false });
+  }
+  proTokens.set(token, Date.now() + 30 * 24 * 3600 * 1000); // sliding renewal
+  res.json({ active: true, subDailySeconds: PRO_DAILY_SECONDS });
+});
 
 const REGISTER_HEADERS = { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Mozilla/5.0 Chrome/147.0.0.0 Safari/537.36" };
 function registerBase(sn) { return { sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web" }; }
