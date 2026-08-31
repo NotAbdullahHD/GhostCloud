@@ -7,6 +7,7 @@
         "http://localhost:4578",
         "https://ghostcloud.ghostos.workers.dev"
       ],
+      "allow_free_hosts": true,
       "max_concurrent_sessions": 8,
       "max_session_seconds": 1140,
       "limits": {

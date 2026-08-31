@@ -241,6 +241,30 @@ function connectRaccoonSignaling(session) {
 }
 function getClientIp(req) { return req.headers["x-caddy-real-ip-is-here1357908642"] || req.socket.remoteAddress || "unknown"; }
 function checkIpLimit(store, ip, windowMs, max) { const now = Date.now(); const hits = (store.get(ip) || []).filter((t) => t > now - windowMs); if (hits.length >= max) return false; hits.push(now); store.set(ip, hits); return true; }
+// Match an origin against an allowlist pattern. Supports exact, a URL prefix
+// (existing behaviour), and a `*` subdomain wildcard like "https://*.pages.dev".
+function originMatches(pattern, origin) {
+  if (pattern === origin) return true;
+  if (origin.startsWith(pattern.replace(/\/+$/, ""))) return true; // prefix
+  const star = pattern.indexOf("*");
+  if (star !== -1) {
+    const pre = pattern.slice(0, star), suf = pattern.slice(star + 1);
+    if (origin.length > pre.length + suf.length && origin.startsWith(pre) && origin.endsWith(suf)) return true;
+  }
+  return false;
+}
+// Common free hosting suffixes — lets you spin up a NEW mirror link (another
+// Cloudflare Pages project, GitHub Pages, Netlify, …) and have it work
+// immediately with zero API edits. The API key is already public in the page
+// source and the concurrency + rate limits still apply, so this doesn't meaningfully
+// raise the key-theft risk (that was always possible via curl, which has no Origin).
+const FREE_HOST_SUFFIXES = [
+  "https://*.pages.dev",
+  "https://*.workers.dev",
+  "https://*.github.io",
+  "https://*.netlify.app",
+  "https://*.vercel.app",
+];
 // Reject requests coming from websites that aren't in the site's allowlist.
 // This stops someone else from pointing their own site at your API even if
 // they steal the API base URL or key from your page source.
@@ -248,8 +272,9 @@ function originAllowed(req, site) {
   const origin = req.headers.origin;
   if (!origin) return true; // non-browser clients (curl, server-to-server) with a valid key
   const allowed = site.allowed_origins || [];
-  if (allowed.includes("*")) return true;
-  return allowed.includes(origin) || allowed.some((a) => origin.startsWith(a.replace(/\/+$/, "")));
+  if (allowed.includes("*") || allowed.includes(origin)) return true;
+  const list = site.allow_free_hosts ? allowed.concat(FREE_HOST_SUFFIXES) : allowed;
+  return list.some((a) => originMatches(a, origin));
 }
 function auth(req, res, next) {
   const apiKey = req.headers["x-api-key"] || req.body?.api_key || req.query?.api_key;
