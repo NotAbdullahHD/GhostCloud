@@ -92,7 +92,7 @@ async function getVerificationCode(mailJwt, maxRetries = 30) {
   }
   throw new Error("Timeout getting verification code");
 }
-const POOL_TARGET = 5;
+const POOL_TARGET = 10;
 const pool = [];
 let poolFilling = false;
 async function fillPool() {
@@ -101,9 +101,10 @@ async function fillPool() {
   if (needed <= 0) return;
   poolFilling = true;
   try {
+    let errors = 0;
     for (let i = 0; i < needed; i++) {
-      try { const acc = await createAccountRaw(); pool.push(acc); console.log(`pool: ready (${pool.length}/${POOL_TARGET})`); }
-      catch (e) { console.log(`pool: fill error — ${e.message}`); break; }
+      try { const acc = await createAccountRaw(); pool.push(acc); errors = 0; console.log(`pool: ready (${pool.length}/${POOL_TARGET})`); }
+      catch (e) { console.log(`pool: fill error — ${e.message}`); if (++errors >= 3) break; await new Promise((r) => setTimeout(r, 3000)); }
     }
   } finally { poolFilling = false; }
 }
@@ -243,27 +244,45 @@ function getClientIp(req) { return req.headers["x-caddy-real-ip-is-here135790864
 function checkIpLimit(store, ip, windowMs, max) { const now = Date.now(); const hits = (store.get(ip) || []).filter((t) => t > now - windowMs); if (hits.length >= max) return false; hits.push(now); store.set(ip, hits); return true; }
 // Match an origin against an allowlist pattern. Supports exact, a URL prefix
 // (existing behaviour), and a `*` subdomain wildcard like "https://*.pages.dev".
+const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 function originMatches(pattern, origin) {
   if (pattern === origin) return true;
-  if (origin.startsWith(pattern.replace(/\/+$/, ""))) return true; // prefix
-  const star = pattern.indexOf("*");
-  if (star !== -1) {
-    const pre = pattern.slice(0, star), suf = pattern.slice(star + 1);
-    if (origin.length > pre.length + suf.length && origin.startsWith(pre) && origin.endsWith(suf)) return true;
-  }
-  return false;
+  if (origin.startsWith(pattern.replace(/\/+$/, ""))) return true; // URL-prefix (legacy)
+  if (!pattern.includes("*")) return false;
+  // Wildcard with support for multiple stars, e.g. "http://*.s3-website-*.amazonaws.com"
+  const re = new RegExp("^" + pattern.split("*").map(escRe).join("[^/]*") + "$");
+  return re.test(origin);
 }
 // Common free hosting suffixes — lets you spin up a NEW mirror link (another
-// Cloudflare Pages project, GitHub Pages, Netlify, …) and have it work
-// immediately with zero API edits. The API key is already public in the page
-// source and the concurrency + rate limits still apply, so this doesn't meaningfully
-// raise the key-theft risk (that was always possible via curl, which has no Origin).
+// Cloudflare Pages project, GitHub Pages, Netlify, Vercel, an S3 bucket, …) and
+// have it work immediately with zero API edits. The API key is already public
+// in the page source and the concurrency + rate limits still apply, so this
+// doesn't meaningfully raise the key-theft risk (that was always possible via
+// curl, which has no Origin header).
 const FREE_HOST_SUFFIXES = [
+  // Cloudflare / Netlify / Vercel / GitHub Pages
   "https://*.pages.dev",
   "https://*.workers.dev",
   "https://*.github.io",
   "https://*.netlify.app",
   "https://*.vercel.app",
+  // Amazon S3
+  "https://s3.amazonaws.com", // any public S3 bucket via the REST endpoint (https://s3.amazonaws.com/<bucket>/index.html)
+  "http://*.s3-website-*.amazonaws.com", // S3 static website hosting (HTTP)
+  "https://*.s3-website-*.amazonaws.com",
+  // Google / Microsoft free hosting (domains schools often allow for other reasons)
+  "https://*.web.app", // Firebase Hosting
+  "https://*.firebaseapp.com", // Firebase legacy
+  "https://storage.googleapis.com", // Google Cloud Storage REST (free tier)
+  "https://*.azurestaticapps.net", // Azure Static Web Apps
+  // Obscure free static hosts
+  "https://*.gitlab.io", // GitLab Pages
+  "https://*.codeberg.page", // Codeberg Pages
+  "https://*.surge.sh", // Surge
+  "https://*.neocities.org", // Neocities
+  "https://*.tiiny.site", // Tiiny.host
+  "https://*.js.org", // js.org free subdomain (served via GitHub Pages)
+  "https://*.onrender.com", // Render static sites
 ];
 // Reject requests coming from websites that aren't in the site's allowlist.
 // This stops someone else from pointing their own site at your API even if
