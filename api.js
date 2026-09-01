@@ -490,6 +490,15 @@ app.post("/cloud/v1/createSession", auth, async (req, res) => {
   const session = { uuid, api_key: apiKey, state: "creating", game_key, sn: "", token: "", created_at: Date.now(), max_session_seconds: sessionLimit, last_queue_poll_at: null, last_ping_at: null, startgame_timeout: null, queue_abandon_timeout: null, ping_timeout: null, session_timeout: null, raccoonWs: null, raccoonPingInterval: null, clientWs: null, costInterval: null };
   sessions.set(uuid, session);
   console.log(`createSession ${game_key} → ${uuid.slice(0, 8)}`);
+  // If the client disconnects while we're still creating/queuing (tab closed,
+  // player cancelled), stop immediately instead of holding the account + slot
+  // and keeping their Raccoon queue position warm.
+  let streamEnded = false;
+  res.on("close", () => {
+    if (streamEnded) return;
+    const s = sessions.get(uuid);
+    if (s && s.state !== "active") killSession(uuid, "client_left_during_setup");
+  });
   try {
     let acc;
     if (manualAccount) {
@@ -536,6 +545,7 @@ app.post("/cloud/v1/createSession", auth, async (req, res) => {
       push({ status: "finished_queue", uuid, fetch_this_within_30s_or_terminate: "/cloud/v1/startGame" });
     }
   } catch (e) { if (!manualAccount) releaseAccountSlot(apiKey); push({ status: "error", error: e.message }); killSession(uuid, "creation_error"); }
+  streamEnded = true;
   res.end();
 });
 app.get("/cloud/v1/getQueue", auth, async (req, res) => {
@@ -614,7 +624,12 @@ httpServer.on("upgrade", (req, socket, head) => {
       if (msg.type === "rtc_offer" && msg.sdp) { rws.send(JSON.stringify({ id: "rtc_sdp", from: session.sn, to: session.gl_key, body: { sdp: msg.sdp, type: "offer" } })); }
       else if (msg.type === "rtc_candidate" && msg.candidate) { rws.send(JSON.stringify({ id: "rtc_sdp", from: session.sn, to: session.gl_key, body: { type: "candidate", sdp: msg.candidate } })); }
     });
-    ws.on("close", () => { session.clientWs = undefined; console.log("client ws closed"); });
+    ws.on("close", () => {
+      session.clientWs = undefined;
+      // The game can't continue without signaling — drop the session promptly
+      // instead of waiting for the ping timeout.
+      if (sessions.get(uuid)) killSession(uuid, "client_ws_closed");
+    });
     ws.on("error", () => { console.log("client ws error"); });
   });
 });
