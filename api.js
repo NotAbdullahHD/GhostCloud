@@ -144,8 +144,18 @@ async function doInitGame(session) {
   const { sn, token, game_key } = session;
   const h = gameHeaders(token);
   const common = { sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web", "manufacturer;": "", user_token: token };
-  await raccoonFetch("/userGame/checkCost", { method: "POST", headers: h, body: new URLSearchParams({ ...common, game_key }) });
+  try {
+    const costRes = await raccoonFetch("/userGame/checkCost", { method: "POST", headers: h, body: new URLSearchParams({ ...common, game_key }) });
+    const costData = await costRes.json().catch(() => null);
+    if (costData && costData.status !== 200) console.log(`checkCost ${game_key}: ${JSON.stringify(costData).slice(0, 200)}`);
+  } catch {}
   const playData = await (await raccoonFetch("/jyapi/playGame", { method: "POST", headers: h, body: new URLSearchParams({ ...common, game_key, model_name: "Chrome/147.0.0.0" }) })).json();
+  // Raccoon status 3004 = account has no diamonds/credits for this game
+  if (playData.status === 3004 || String(playData.msg || "").toLowerCase().includes("diamond")) {
+    const err = new Error("This game needs play credits the temporary account doesn't have — try again in a moment or pick another game.");
+    err.isDiamondError = true;
+    throw err;
+  }
   if (playData.status === 201 || (playData.status === 200 && playData.data?.play_queue_id)) {
     const qid = playData.data?.play_queue_id;
     if (!qid) throw new Error("Missing queue ID");
@@ -493,7 +503,28 @@ app.post("/cloud/v1/createSession", auth, async (req, res) => {
     }
     session.sn = acc.sn; session.token = acc.token; recordUsage(apiKey);
     push({ status: "requesting_game" });
-    const init = await doInitGame(session); if (!sessions.has(uuid)) return res.end();
+    // Fresh temp accounts can be out of credits (Raccoon status 3004) — try up to
+    // 2 more accounts before giving up, so one drained account doesn't fail the player.
+    let init = null;
+    let creditRetries = 0;
+    while (!init) {
+      try {
+        init = await doInitGame(session);
+      } catch (e) {
+        if (e && e.isDiamondError && !manualAccount && creditRetries < 2) {
+          creditRetries++;
+          console.log(`no credits on ${uuid.slice(0, 8)} — trying another account (${creditRetries})`);
+          push({ status: "creating_account" });
+          acc = await createAccount();
+          session.sn = acc.sn; session.token = acc.token;
+          push({ status: "account_ready" });
+          push({ status: "requesting_game" });
+          continue;
+        }
+        throw e;
+      }
+    }
+    if (!sessions.has(uuid)) return res.end();
     if (init.queued) {
       session.state = "queued"; session.queue_id = init.queue_id;
       session.queue_abandon_timeout = setTimeout(() => killSession(uuid, "queue_abandoned"), 60000);
