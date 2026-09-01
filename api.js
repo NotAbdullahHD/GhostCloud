@@ -362,38 +362,48 @@ app.get("/cloud/v1/online", auth, (req, res) => res.json({ online: onlineCount()
 // ── Pro entitlements (server-validated) ────────────────────
 // The Pro code never ships to the browser; the client sends it here once and the
 // API validates it, then issues a signed entitlement token that grants Pro.
-const PRO_CODE_HASH = "f3f8b1ec69ffdd8ad2571814296e513d2e5b6767ecde5ce576b53441d6929451";
+// Code + reset management (no code edits needed):
+//   - GHOSTCLOUD_PRO_CODE : the current Pro code. Set it in Render → Environment
+//     and restart. The plaintext NEVER ships in this file or the repo.
+//   - GHOSTCLOUD_PRO_EPOCH : bump this number to instantly invalidate every
+//     existing Pro token (e.g. the moment a giveaway winner redeems, so the
+//     code they share with friends stops working).
+// If GHOSTCLOUD_PRO_CODE is unset, Pro activation is disabled entirely.
+const PRO_CODE = process.env.GHOSTCLOUD_PRO_CODE || "";
+const PRO_EPOCH = process.env.GHOSTCLOUD_PRO_EPOCH || "1";
 const PRO_DAILY_SECONDS = 8 * 3600; // 8h/day for Pro
-const proTokens = new Map(); // token -> expiresAt (ms)
+if (!PRO_CODE) console.log("⚠️  GHOSTCLOUD_PRO_CODE is not set — Pro activation is DISABLED. Set it in Render → Environment → New Variable and restart.");
+const proTokens = new Map(); // token -> { exp, epoch }
 const proAttempts = new Map(); // ip -> timestamps (brute-force guard on code entry)
 function proTokenNew() { return randomUUID().replace(/-/g, "") + randomUUID().replace(/-/g, ""); }
 setInterval(() => {
   const now = Date.now();
-  for (const [t, exp] of proTokens) if (now > exp) proTokens.delete(t);
+  for (const [t, v] of proTokens) if (now > v.exp) proTokens.delete(t);
   for (const [ip, arr] of proAttempts) proAttempts.set(ip, arr.filter((x) => x > now - 60000));
 }, 60 * 1000);
 app.post("/cloud/v1/activatePro", auth, (req, res) => {
+  if (!PRO_CODE) return res.status(503).json({ error: "Pro is not configured yet — try again later." });
   const ip = getClientIp(req);
   const now = Date.now();
   const attempts = (proAttempts.get(ip) || []).filter((x) => x > now - 60000);
   if (attempts.length >= 5) return res.status(429).json({ error: "Too many attempts. Try again later." });
   proAttempts.set(ip, [...attempts, now]);
   const code = String((req.body || {}).code || "").trim();
-  if (!code || createHash("sha256").update(code).digest("hex") !== PRO_CODE_HASH) {
+  if (!code || code !== PRO_CODE) {
     return res.status(401).json({ error: "Invalid code." });
   }
   const token = proTokenNew();
-  proTokens.set(token, Date.now() + 30 * 24 * 3600 * 1000); // 30-day token (sliding)
+  proTokens.set(token, { exp: Date.now() + 30 * 24 * 3600 * 1000, epoch: PRO_EPOCH }); // 30-day token (sliding)
   res.json({ ok: true, token, subDailySeconds: PRO_DAILY_SECONDS });
 });
 app.post("/cloud/v1/verifyPro", auth, (req, res) => {
   const token = String((req.body || {}).token || "");
-  const exp = proTokens.get(token);
-  if (!token || !exp || Date.now() > exp) {
+  const v = proTokens.get(token);
+  if (!token || !v || v.epoch !== PRO_EPOCH || Date.now() > v.exp) {
     if (token) proTokens.delete(token);
     return res.json({ active: false });
   }
-  proTokens.set(token, Date.now() + 30 * 24 * 3600 * 1000); // sliding renewal
+  proTokens.set(token, { exp: Date.now() + 30 * 24 * 3600 * 1000, epoch: PRO_EPOCH }); // sliding renewal
   res.json({ active: true, subDailySeconds: PRO_DAILY_SECONDS });
 });
 
