@@ -193,6 +193,12 @@ async function createAccountRaw() {
 function gameHeaders(token) {
   return { accept: "*/*", "content-type": "application/x-www-form-urlencoded; charset=UTF-8", cookie: `as_user_token=${token}`, origin: "https://www.raccoongame.com", referer: "https://www.raccoongame.com/?t=1720436119", "user-agent": "Mozilla/5.0 Chrome/147.0.0.0 Safari/537.36", "x-requested-with": "XMLHttpRequest" };
 }
+// Games Raccoon marks as membership-only (status 4623) can never be played by
+// temp accounts — remember them so we fail fast instead of burning an account
+// on them every time someone clicks Play. Cache expires after 6h (games can change).
+const MEMBERSHIP_GAME_MSG = "This game requires a paid membership on the game service — temporary accounts can't play it. Try another game.";
+const MEMBERSHIP_BLOCK_TTL = 6 * 3600 * 1000;
+const membershipBlockedGames = new Map(); // game_key -> expiresAt
 async function doInitGame(session) {
   const { sn, token, game_key } = session;
   const h = gameHeaders(token);
@@ -207,6 +213,12 @@ async function doInitGame(session) {
   if (playData.status === 3004 || String(playData.msg || "").toLowerCase().includes("diamond")) {
     const err = new Error("This game needs play credits the temporary account doesn't have — try again in a moment or pick another game.");
     err.isDiamondError = true;
+    throw err;
+  }
+  // Raccoon status 4623 = this game needs a paid membership — no temp account can play it
+  if (playData.status === 4623 || /membership/i.test(String(playData.msg || ""))) {
+    const err = new Error(MEMBERSHIP_GAME_MSG);
+    err.isMembershipError = true;
     throw err;
   }
   if (playData.status === 201 || (playData.status === 200 && playData.data?.play_queue_id)) {
@@ -538,6 +550,11 @@ app.post("/cloud/v1/createSession", auth, async (req, res) => {
   if (!game_key || typeof game_key !== "string" || game_key.length > 256) return res.status(400).json({ error: "Invalid game_key." });
   const manualAccount = account && typeof account.sn === "string" && typeof account.token === "string" && account.sn && account.token ? account : null;
   const { site, apiKey } = req;
+  // Known membership-only games fail fast (no account wasted). Manual accounts
+  // (user's own, possibly with a membership) are still allowed through.
+  if (!manualAccount && (membershipBlockedGames.get(game_key) || 0) > Date.now()) {
+    return res.status(409).json({ error: MEMBERSHIP_GAME_MSG });
+  }
   if (countActiveSessions(apiKey) >= site.max_concurrent_sessions) return res.status(429).json({ error: "Concurrent session limit reached." });
   const rl = checkRateLimit(apiKey, site); if (!rl.allowed) return res.status(429).json({ error: `Rate limit: ${rl.reason}` });
   if (!manualAccount && !acquireAccountSlot(apiKey, site)) return res.status(429).json({ error: "Too many sessions being created." });
@@ -606,7 +623,11 @@ app.post("/cloud/v1/createSession", auth, async (req, res) => {
       session.startgame_timeout = setTimeout(() => killSession(uuid, "startgame_timeout"), 30000);
       push({ status: "finished_queue", uuid, fetch_this_within_30s_or_terminate: "/cloud/v1/startGame" });
     }
-  } catch (e) { if (!manualAccount) releaseAccountSlot(apiKey); push({ status: "error", error: e.message }); killSession(uuid, "creation_error"); }
+  } catch (e) {
+    if (!manualAccount) releaseAccountSlot(apiKey);
+    if (e && e.isMembershipError && !manualAccount) membershipBlockedGames.set(game_key, Date.now() + MEMBERSHIP_BLOCK_TTL);
+    push({ status: "error", error: e.message }); killSession(uuid, "creation_error");
+  }
   streamEnded = true;
   res.end();
 });
