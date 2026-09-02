@@ -585,7 +585,25 @@ app.post("/cloud/v1/createSession", auth, async (req, res) => {
       push({ status: "account_ready" });
     } else {
       push({ status: "creating_account" });
-      acc = await createAccount(); releaseAccountSlot(apiKey);
+      // The mail provider throttles per IP (429) and during a throttle window
+      // only allows a trickle of registrations. Instead of dying on the first
+      // 429, wait through a few spaced retries so the session catches the next
+      // allowed slot. (Serial queue means these can't stack into a burst.)
+      let accTries = 0;
+      while (true) {
+        try {
+          acc = await createAccount();
+          break;
+        } catch (e) {
+          if (e && e.cancelled) throw e;
+          if (++accTries > 3) throw e;
+          console.log(`account throttled on ${uuid.slice(0, 8)} — retry ${accTries}/3`);
+          await new Promise((r) => setTimeout(r, 15000));
+          if (!sessions.has(uuid)) return res.end(); // player left during the wait
+          push({ status: "creating_account" });
+        }
+      }
+      releaseAccountSlot(apiKey);
       if (!sessions.has(uuid)) return res.end();
       push({ status: "account_ready" });
     }
