@@ -108,46 +108,63 @@ async function getVerificationCode(mailJwt, maxRetries = 30) {
 }
 // Warm pool size — tunable via GHOSTCLOUD_POOL_TARGET env (Render → Environment).
 // Each concurrent player burns one temp account, so a bigger pool = more instant starts.
-const POOL_TARGET = Math.min(Math.max(parseInt(process.env.GHOSTCLOUD_POOL_TARGET || "20", 10) || 20, 5), 40);
-const POOL_CONCURRENCY = Math.min(Math.max(parseInt(process.env.GHOSTCLOUD_POOL_CONCURRENCY || "2", 10) || 2, 1), 5);
+// Keep it modest: the mail provider rate-limits registrations per IP, and every
+// account in the pool is one registration we've already been allowed.
+const POOL_TARGET = Math.min(Math.max(parseInt(process.env.GHOSTCLOUD_POOL_TARGET || "15", 10) || 15, 5), 30);
 const pool = [];
 let poolFilling = false;
+
+// ── Global account-creation queue ──────────────────────────
+// The mail provider 429s bursts of parallel registrations from one IP (that's
+// what the logs showed). EVERY registration — pool fill AND on-demand from
+// sessions — goes through ONE queue, so at most one is ever in flight per
+// instance. This matches the old serial cadence that worked for weeks.
+let creationChain = Promise.resolve();
+function serialCreateAccount() {
+  const run = creationChain.then(() => createAccountRaw(), () => createAccountRaw());
+  creationChain = run.catch(() => {});
+  return run;
+}
+// Is any live session stuck waiting for an account right now? If so, pool fill
+// yields so the waiting player gets the next registration slot instead of the pool.
+function anySessionWaitingForAccount() {
+  for (const s of sessions.values()) if (s.state === "creating" && !s.sn) return true;
+  return false;
+}
 async function fillPool() {
   if (poolFilling) return;
   const needed = POOL_TARGET - pool.length;
   if (needed <= 0) return;
   poolFilling = true;
   try {
-    // Create accounts in parallel (a few at a time) so the pool fills faster than
-    // serial but doesn't trip the mail provider's per-IP limits with a big burst.
-    let next = 0;
+    // Serial fill (one at a time). A burst is what gets us throttled.
     let errors = 0;
-    const worker = async () => {
-      let wait = 2000;
-      while (true) {
-        const i = next++;
-        if (i >= needed) return;
-        try {
-          const acc = await createAccountRaw();
-          pool.push(acc); errors = 0; wait = 2000;
-          console.log(`pool: ready (${pool.length}/${POOL_TARGET})`);
-        } catch (e) {
-          console.log(`pool: fill error — ${e.message}`);
-          if (++errors >= 6) return; // give this round a rest; the self-heal timer retries
-          await new Promise((r) => setTimeout(r, wait)); // backoff: 2s, 4s, 8s, 15s, 15s…
-          wait = Math.min(wait * 2, 15000);
-        }
+    for (let i = 0; i < needed; i++) {
+      if (anySessionWaitingForAccount()) break; // let a player take the next slot
+      try {
+        const acc = await serialCreateAccount();
+        pool.push(acc);
+        errors = 0;
+        console.log(`pool: ready (${pool.length}/${POOL_TARGET})`);
+      } catch (e) {
+        console.log(`pool: fill error — ${e.message}`);
+        if (++errors >= 5) break; // rest; the self-heal timer retries later
+        // 429 = provider throttling this IP — stop poking it for a while
+        const wait = /429/.test(e.message) ? 30000 : 3000;
+        await new Promise((r) => setTimeout(r, wait));
       }
-    };
-    await Promise.all(Array.from({ length: POOL_CONCURRENCY }, worker));
+    }
   } finally { poolFilling = false; }
 }
-// Self-heal: if the pool ever falls short (mail provider hiccup / IP block lifts),
-// keep refilling in the background so the server recovers without a restart.
+// Self-heal: if the pool ever falls short (throttle window / provider hiccup),
+// keep refilling gently in the background so the server recovers without a restart.
 setInterval(() => { if (pool.length < POOL_TARGET) fillPool().catch(() => {}); }, 60000);
 async function createAccount() {
   if (pool.length > 0) { const acc = pool.shift(); console.log(`pool: served (${pool.length} left)`); fillPool().catch(() => {}); return acc; }
-  const acc = await createAccountRaw(); fillPool().catch(() => {}); return acc;
+  // Pool empty — take the next slot on the global queue (serialized with pool fill)
+  const acc = await serialCreateAccount();
+  fillPool().catch(() => {});
+  return acc;
 }
 async function createAccountRaw() {
   const domainData = await mailJson("/domains", {}, "domains");
