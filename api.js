@@ -54,6 +54,20 @@ async function raccoonFetch(pathAndQuery, opts = {}) {
     return fetchWithTimeout(`https://${RACCOON_HOST}${pathAndQuery}`, opts);
   }
 }
+
+// Guarded JSON helper for the mail service — surfaces HTTP status / empty bodies
+// in logs so an IP block (403), rate limit (429), or service outage is easy to
+// tell apart instead of a cryptic "Unexpected end of JSON input".
+async function mailJson(path, opts = {}, what = path) {
+  let res;
+  try { res = await fetchWithTimeout(`${MAIL_BASE}${path}`, opts, 15000); }
+  catch (e) { throw new Error(`mail: ${what} unreachable (${e.message})`); }
+  if (!res.ok) throw new Error(`mail: ${what} HTTP ${res.status}`);
+  const text = await res.text();
+  if (!text) throw new Error(`mail: ${what} empty response`);
+  try { return JSON.parse(text); }
+  catch { throw new Error(`mail: ${what} bad JSON`); }
+}
 const sessions = new Map();
 const siteUsage = new Map();
 const ipLimits = new Map();
@@ -95,6 +109,7 @@ async function getVerificationCode(mailJwt, maxRetries = 30) {
 // Warm pool size — tunable via GHOSTCLOUD_POOL_TARGET env (Render → Environment).
 // Each concurrent player burns one temp account, so a bigger pool = more instant starts.
 const POOL_TARGET = Math.min(Math.max(parseInt(process.env.GHOSTCLOUD_POOL_TARGET || "20", 10) || 20, 5), 40);
+const POOL_CONCURRENCY = Math.min(Math.max(parseInt(process.env.GHOSTCLOUD_POOL_CONCURRENCY || "2", 10) || 2, 1), 5);
 const pool = [];
 let poolFilling = false;
 async function fillPool() {
@@ -103,28 +118,39 @@ async function fillPool() {
   if (needed <= 0) return;
   poolFilling = true;
   try {
-    // Create accounts in parallel (3 at a time) so the pool fills ~3x faster
-    // and keeps up with bursts of players.
+    // Create accounts in parallel (a few at a time) so the pool fills faster than
+    // serial but doesn't trip the mail provider's per-IP limits with a big burst.
     let next = 0;
     let errors = 0;
-    const CONCURRENCY = 3;
     const worker = async () => {
+      let wait = 2000;
       while (true) {
         const i = next++;
         if (i >= needed) return;
-        try { const acc = await createAccountRaw(); pool.push(acc); errors = 0; console.log(`pool: ready (${pool.length}/${POOL_TARGET})`); }
-        catch (e) { console.log(`pool: fill error — ${e.message}`); if (++errors >= 4) break; await new Promise((r) => setTimeout(r, 3000)); }
+        try {
+          const acc = await createAccountRaw();
+          pool.push(acc); errors = 0; wait = 2000;
+          console.log(`pool: ready (${pool.length}/${POOL_TARGET})`);
+        } catch (e) {
+          console.log(`pool: fill error — ${e.message}`);
+          if (++errors >= 6) return; // give this round a rest; the self-heal timer retries
+          await new Promise((r) => setTimeout(r, wait)); // backoff: 2s, 4s, 8s, 15s, 15s…
+          wait = Math.min(wait * 2, 15000);
+        }
       }
     };
-    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+    await Promise.all(Array.from({ length: POOL_CONCURRENCY }, worker));
   } finally { poolFilling = false; }
 }
+// Self-heal: if the pool ever falls short (mail provider hiccup / IP block lifts),
+// keep refilling in the background so the server recovers without a restart.
+setInterval(() => { if (pool.length < POOL_TARGET) fillPool().catch(() => {}); }, 60000);
 async function createAccount() {
   if (pool.length > 0) { const acc = pool.shift(); console.log(`pool: served (${pool.length} left)`); fillPool().catch(() => {}); return acc; }
   const acc = await createAccountRaw(); fillPool().catch(() => {}); return acc;
 }
 async function createAccountRaw() {
-  const domainData = await (await fetchWithTimeout(`${MAIL_BASE}/domains`)).json();
+  const domainData = await mailJson("/domains", {}, "domains");
   if (!domainData["hydra:member"]?.length) throw new Error("No Mail.tm domains available");
   const domain = domainData["hydra:member"][0].domain;
   const mailUser = `rcn_${Math.random().toString(36).substring(2, 11)}`;
@@ -134,9 +160,8 @@ async function createAccountRaw() {
   const sn = generateSN();
   const h = { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Mozilla/5.0 Chrome/147.0.0.0 Safari/537.36" };
   const base = { sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web" };
-  await fetchWithTimeout(`${MAIL_BASE}/accounts`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) });
-  const tokenRes = await fetchWithTimeout(`${MAIL_BASE}/token`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) });
-  const { token: mailJwt } = await tokenRes.json();
+  await mailJson("/accounts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) }, "create mailbox");
+  const { token: mailJwt } = await mailJson("/token", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) }, "mail token");
   await raccoonFetch("/users/sendEmail", { method: "POST", headers: h, body: new URLSearchParams({ email, type: "register", ...base }) });
   const code = await getVerificationCode(mailJwt);
   await raccoonFetch("/users/emailRegister", { method: "POST", headers: h, body: new URLSearchParams({ email, code, password: raccoonPassword, phone: "1", country: "Brazil", ...base }) });
@@ -424,14 +449,13 @@ function registerBase(sn) { return { sn, model: "Chrome/147.0.0.0", version_code
 // Create a mail.gw mailbox — Raccoon actually delivers verification mail to these domains
 // (unlike temp-mail.org, which Raccoon silently drops).
 async function createMailbox() {
-  const domainData = await (await fetchWithTimeout(`${MAIL_BASE}/domains`)).json();
+  const domainData = await mailJson("/domains", {}, "domains");
   if (!domainData["hydra:member"]?.length) throw new Error("No mail domains available");
   const domain = domainData["hydra:member"][0].domain;
   const email = `rcn_${Math.random().toString(36).substring(2, 11)}@${domain}`;
   const mailPassword = generatePassword();
-  await fetchWithTimeout(`${MAIL_BASE}/accounts`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) });
-  const tokenRes = await fetchWithTimeout(`${MAIL_BASE}/token`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) });
-  const { token: mailJwt } = await tokenRes.json();
+  await mailJson("/accounts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) }, "create mailbox");
+  const { token: mailJwt } = await mailJson("/token", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) }, "mail token");
   return { email, mailJwt };
 }
 
