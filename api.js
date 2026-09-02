@@ -92,7 +92,9 @@ async function getVerificationCode(mailJwt, maxRetries = 30) {
   }
   throw new Error("Timeout getting verification code");
 }
-const POOL_TARGET = 10;
+// Warm pool size — tunable via GHOSTCLOUD_POOL_TARGET env (Render → Environment).
+// Each concurrent player burns one temp account, so a bigger pool = more instant starts.
+const POOL_TARGET = Math.min(Math.max(parseInt(process.env.GHOSTCLOUD_POOL_TARGET || "20", 10) || 20, 5), 40);
 const pool = [];
 let poolFilling = false;
 async function fillPool() {
@@ -101,11 +103,20 @@ async function fillPool() {
   if (needed <= 0) return;
   poolFilling = true;
   try {
+    // Create accounts in parallel (3 at a time) so the pool fills ~3x faster
+    // and keeps up with bursts of players.
+    let next = 0;
     let errors = 0;
-    for (let i = 0; i < needed; i++) {
-      try { const acc = await createAccountRaw(); pool.push(acc); errors = 0; console.log(`pool: ready (${pool.length}/${POOL_TARGET})`); }
-      catch (e) { console.log(`pool: fill error — ${e.message}`); if (++errors >= 3) break; await new Promise((r) => setTimeout(r, 3000)); }
-    }
+    const CONCURRENCY = 3;
+    const worker = async () => {
+      while (true) {
+        const i = next++;
+        if (i >= needed) return;
+        try { const acc = await createAccountRaw(); pool.push(acc); errors = 0; console.log(`pool: ready (${pool.length}/${POOL_TARGET})`); }
+        catch (e) { console.log(`pool: fill error — ${e.message}`); if (++errors >= 4) break; await new Promise((r) => setTimeout(r, 3000)); }
+      }
+    };
+    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
   } finally { poolFilling = false; }
 }
 async function createAccount() {

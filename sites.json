@@ -8,10 +8,10 @@
         "https://ghostcloud.ghostos.workers.dev"
       ],
       "allow_free_hosts": true,
-      "max_concurrent_sessions": 15,
+      "max_concurrent_sessions": 35,
       "max_session_seconds": 1140,
       "limits": {
-        "per_minute": 60,
+        "per_minute": 150,
         "per_hour": 3600,
         "per_day": 86400,
         "per_month": 2592000
