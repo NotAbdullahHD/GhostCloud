@@ -41,6 +41,17 @@ async function fetchWithTimeout(url, opts = {}, ms = RACCOON_TIMEOUT_MS) {
   try { return await fetch(url, { ...opts, signal: ctrl.signal }); }
   finally { clearTimeout(timer); }
 }
+// Parse a response body as JSON with a friendly failure message. When the mail
+// or game provider is throttling (that's exactly what happens under load) they
+// return EMPTY bodies, and the old `res.json()` produced the cryptic
+// "Unexpected end of JSON input" that players were seeing. This surfaces a
+// message both the player and the Render logs can actually read.
+async function parseJson(res, what) {
+  const text = await res.text();
+  if (!text) throw new Error(`${what} is under heavy load right now and sent no response — try again in a moment.`);
+  try { return JSON.parse(text); }
+  catch { throw new Error(`${what} sent an invalid response — try again in a moment.`); }
+}
 async function raccoonFetch(pathAndQuery, opts = {}) {
   const entry = await resolveRaccoonIp();
   if (!entry) return fetchWithTimeout(`https://${RACCOON_HOST}${pathAndQuery}`, opts);
@@ -75,16 +86,51 @@ function generatePassword() {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$";
   let p = ""; for (let i = 0; i < 12; i++) p += chars[Math.floor(Math.random() * chars.length)]; return p;
 }
-async function getVerificationCode(mailJwt, maxRetries = 30) {
+// ── Mail providers ──────────────────────────────────────────────────────────
+// Raccoon only DELIVERS verification mail to SOME temp-mail providers. mail.tm
+// and temp-mail.org reply "success" but silently drop the mail (tested), while
+// api.mail.gw delivers (tested ~12s). Add more provider bases to this list (a
+// mail.tm-compatible mirror, another provider) and the code rotates through
+// them automatically, remembering which ones currently work.
+//   GHOSTCLOUD_MAIL_PROVIDERS="https://api.mail.gw,https://api.other.tld"
+const MAIL_PROVIDERS = (process.env.GHOSTCLOUD_MAIL_PROVIDERS || "https://api.mail.gw")
+  .split(",").map((s) => s.trim()).filter(Boolean);
+const providerHealth = new Map(); // base -> { fails, skipUntil }
+// Providers that aren't currently skipped, in config order. If EVERY provider
+// is marked down, fall back to trying them all (better than nothing).
+function providerOrder() {
+  const now = Date.now();
+  const healthy = MAIL_PROVIDERS.filter((b) => { const h = providerHealth.get(b); return !h || h.skipUntil <= now; });
+  return healthy.length > 0 ? healthy : MAIL_PROVIDERS;
+}
+function noteProviderOk(base) { providerHealth.delete(base); }
+function noteProviderFail(base) {
+  const h = providerHealth.get(base) || { fails: 0, skipUntil: 0 };
+  h.fails += 1;
+  if (h.fails >= 3) { h.skipUntil = Date.now() + 5 * 60000; h.fails = 0; console.log(`mail provider ${base} failing — skipping for 5 min`); }
+  providerHealth.set(base, h);
+}
+async function createMailboxOn(base) {
+  const domainData = await parseJson(await fetchWithTimeout(`${base}/domains`), "Account service");
+  if (!domainData["hydra:member"]?.length) throw new Error("No mail domains available");
+  const domain = domainData["hydra:member"][0].domain;
+  const email = `rcn_${Math.random().toString(36).substring(2, 11)}@${domain}`;
+  const mailPassword = generatePassword();
+  await fetchWithTimeout(`${base}/accounts`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) });
+  const { token: mailJwt } = await parseJson(await fetchWithTimeout(`${base}/token`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) }), "Account service");
+  return { email, mailJwt, base };
+}
+async function getVerificationCode(mailJwt, base, maxRetries = 30) {
+  // base = the mail provider the mailbox was created on (rotation-aware)
   const headers = { Authorization: `Bearer ${mailJwt}`, "Content-Type": "application/json" };
   for (let i = 0; i < maxRetries; i++) {
     await new Promise((r) => setTimeout(r, 3000));
     try {
-      const res = await fetchWithTimeout(`${MAIL_BASE}/messages?page=1`, { headers });
-      const data = await res.json();
+      const res = await fetchWithTimeout(`${base}/messages?page=1`, { headers });
+      const data = await parseJson(res, "Mail service");
       if (data["hydra:member"]?.length > 0) {
         const msgId = data["hydra:member"][0].id;
-        const full = await (await fetchWithTimeout(`${MAIL_BASE}/messages/${msgId}`, { headers })).json();
+        const full = await parseJson(await fetchWithTimeout(`${base}/messages/${msgId}`, { headers }), "Mail service");
         const match = (full.text || full.html || "").replace(/<[^>]*>/g, "").match(/\b\d{6}\b/);
         if (match) return match[0];
       }
@@ -113,29 +159,40 @@ async function createAccount() {
   const acc = await createAccountRaw(); fillPool().catch(() => {}); return acc;
 }
 async function createAccountRaw() {
-  const domainData = await (await fetchWithTimeout(`${MAIL_BASE}/domains`)).json();
-  if (!domainData["hydra:member"]?.length) throw new Error("No Mail.tm domains available");
-  const domain = domainData["hydra:member"][0].domain;
-  const mailUser = `rcn_${Math.random().toString(36).substring(2, 11)}`;
-  const email = `${mailUser}@${domain}`;
-  const mailPassword = generatePassword();
-  const raccoonPassword = generatePassword();
-  const sn = generateSN();
-  const h = { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Mozilla/5.0 Chrome/147.0.0.0 Safari/537.36" };
-  const base = { sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web" };
-  await fetchWithTimeout(`${MAIL_BASE}/accounts`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) });
-  const tokenRes = await fetchWithTimeout(`${MAIL_BASE}/token`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) });
-  const { token: mailJwt } = await tokenRes.json();
-  await raccoonFetch("/users/sendEmail", { method: "POST", headers: h, body: new URLSearchParams({ email, type: "register", ...base }) });
-  const code = await getVerificationCode(mailJwt);
-  await raccoonFetch("/users/emailRegister", { method: "POST", headers: h, body: new URLSearchParams({ email, code, password: raccoonPassword, phone: "1", country: "Brazil", ...base }) });
-  const loginRes = await raccoonFetch("/users/emailLogin", { method: "POST", headers: h, body: new URLSearchParams({ email, password: raccoonPassword, ...base }) });
-  const loginData = await loginRes.json();
-  if (loginData.status !== 200) throw new Error("Login failed");
-  let userToken = loginData.data?.user_token || "";
-  const cookie = loginRes.headers.get("set-cookie");
-  if (cookie) { const m = cookie.match(/as_user_token=([^;]+)/); if (m) userToken = m[1]; }
-  return { sn, token: userToken };
+  // Try each provider in order. Raccoon's sendEmail is occasionally flaky
+  // (replies success, drops the mail), so we request the code up to 2 times per
+  // mailbox before moving on to the next provider. A provider that keeps
+  // failing gets skipped for 5 minutes so we stop wasting time on it.
+  let lastErr = null;
+  for (const base of providerOrder()) {
+    try {
+      const { email, mailJwt } = await createMailboxOn(base);
+      const raccoonPassword = generatePassword();
+      const sn = generateSN();
+      const h = { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Mozilla/5.0 Chrome/147.0.0.0 Safari/537.36" };
+      const common = { sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web" };
+      let code = null;
+      for (let attempt = 0; attempt < 2 && !code; attempt++) {
+        await raccoonFetch("/users/sendEmail", { method: "POST", headers: h, body: new URLSearchParams({ email, type: "register", ...common }) });
+        try { code = await getVerificationCode(mailJwt, base, 17); } // ~50s per send attempt
+        catch (e) { lastErr = e; }
+      }
+      if (!code) { noteProviderFail(base); continue; }
+      await raccoonFetch("/users/emailRegister", { method: "POST", headers: h, body: new URLSearchParams({ email, code, password: raccoonPassword, phone: "1", country: "Brazil", ...common }) });
+      const loginRes = await raccoonFetch("/users/emailLogin", { method: "POST", headers: h, body: new URLSearchParams({ email, password: raccoonPassword, ...common }) });
+      const loginData = await parseJson(loginRes, "Raccoon login");
+      if (loginData.status !== 200) { noteProviderFail(base); throw new Error("Login failed"); }
+      let userToken = loginData.data?.user_token || "";
+      const cookie = loginRes.headers.get("set-cookie");
+      if (cookie) { const m = cookie.match(/as_user_token=([^;]+)/); if (m) userToken = m[1]; }
+      noteProviderOk(base);
+      return { sn, token: userToken };
+    } catch (e) {
+      lastErr = e;
+      noteProviderFail(base);
+    }
+  }
+  throw lastErr || new Error("Account creation failed on all providers");
 }
 function gameHeaders(token) {
   return { accept: "*/*", "content-type": "application/x-www-form-urlencoded; charset=UTF-8", cookie: `as_user_token=${token}`, origin: "https://www.raccoongame.com", referer: "https://www.raccoongame.com/?t=1720436119", "user-agent": "Mozilla/5.0 Chrome/147.0.0.0 Safari/537.36", "x-requested-with": "XMLHttpRequest" };
@@ -149,7 +206,7 @@ async function doInitGame(session) {
     const costData = await costRes.json().catch(() => null);
     if (costData && costData.status !== 200) console.log(`checkCost ${game_key}: ${JSON.stringify(costData).slice(0, 200)}`);
   } catch {}
-  const playData = await (await raccoonFetch("/jyapi/playGame", { method: "POST", headers: h, body: new URLSearchParams({ ...common, game_key, model_name: "Chrome/147.0.0.0" }) })).json();
+  const playData = await parseJson(await raccoonFetch("/jyapi/playGame", { method: "POST", headers: h, body: new URLSearchParams({ ...common, game_key, model_name: "Chrome/147.0.0.0" }) }), "Game service");
   // Raccoon status 3004 = account has no diamonds/credits for this game
   if (playData.status === 3004 || String(playData.msg || "").toLowerCase().includes("diamond")) {
     const err = new Error("This game needs play credits the temporary account doesn't have — try again in a moment or pick another game.");
@@ -169,13 +226,13 @@ async function doInitGame(session) {
 }
 async function doPollQueue(session, queue_id) {
   const { sn, token } = session;
-  const d = await (await raccoonFetch("/jyapi/playQueue", { method: "POST", headers: gameHeaders(token), body: new URLSearchParams({ sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web", "manufacturer;": "", play_queue_id: queue_id, user_token: token }) })).json();
+  const d = await parseJson(await raccoonFetch("/jyapi/playQueue", { method: "POST", headers: gameHeaders(token), body: new URLSearchParams({ sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web", "manufacturer;": "", play_queue_id: queue_id, user_token: token }) }), "Game queue");
   if (d.status !== 200 && d.status !== 201) throw new Error(`Queue poll rejected: ${JSON.stringify(d)}`);
   return d.data?.queue_pos ?? 1;
 }
 async function doClaimGame(session, queue_id) {
   const { sn, token, game_key } = session;
-  const d = await (await raccoonFetch("/jyapi/playGame", { method: "POST", headers: gameHeaders(token), body: new URLSearchParams({ sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web", "manufacturer;": "", game_key, model_name: "Chrome/147.0.0.0", play_queue_id: queue_id, user_token: token }) })).json();
+  const d = await parseJson(await raccoonFetch("/jyapi/playGame", { method: "POST", headers: gameHeaders(token), body: new URLSearchParams({ sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web", "manufacturer;": "", game_key, model_name: "Chrome/147.0.0.0", play_queue_id: queue_id, user_token: token }) }), "Game service");
   if (d.status === 200 && d.data?.result) return decryptPayload(d.data.result);
   throw new Error(`Failed to claim game. API Status: ${d.status}`);
 }
@@ -414,18 +471,11 @@ app.post("/cloud/v1/verifyPro", auth, (req, res) => {
 const REGISTER_HEADERS = { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Mozilla/5.0 Chrome/147.0.0.0 Safari/537.36" };
 function registerBase(sn) { return { sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web" }; }
 
-// Create a mail.gw mailbox — Raccoon actually delivers verification mail to these domains
-// (unlike temp-mail.org, which Raccoon silently drops).
+// Create a temp mailbox for the manual-login path. Pinned to the PRIMARY
+// provider on purpose: the client reads codes via /getCode which polls the
+// primary too, so the mailbox and the poll must agree.
 async function createMailbox() {
-  const domainData = await (await fetchWithTimeout(`${MAIL_BASE}/domains`)).json();
-  if (!domainData["hydra:member"]?.length) throw new Error("No mail domains available");
-  const domain = domainData["hydra:member"][0].domain;
-  const email = `rcn_${Math.random().toString(36).substring(2, 11)}@${domain}`;
-  const mailPassword = generatePassword();
-  await fetchWithTimeout(`${MAIL_BASE}/accounts`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) });
-  const tokenRes = await fetchWithTimeout(`${MAIL_BASE}/token`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) });
-  const { token: mailJwt } = await tokenRes.json();
-  return { email, mailJwt };
+  return createMailboxOn(MAIL_PROVIDERS[0]);
 }
 
 app.post("/cloud/v1/createMailbox", auth, async (req, res) => {
@@ -440,10 +490,10 @@ app.post("/cloud/v1/getCode", auth, async (req, res) => {
   try {
     const headers = { Authorization: `Bearer ${mailJwt}`, "Content-Type": "application/json" };
     const r = await fetchWithTimeout(`${MAIL_BASE}/messages?page=1`, { headers });
-    const data = await r.json();
+    const data = await parseJson(r, "Mail service");
     if (data["hydra:member"]?.length > 0) {
       const msgId = data["hydra:member"][0].id;
-      const full = await (await fetchWithTimeout(`${MAIL_BASE}/messages/${msgId}`, { headers })).json();
+      const full = await parseJson(await fetchWithTimeout(`${MAIL_BASE}/messages/${msgId}`, { headers }), "Mail service");
       const match = (full.text || full.html || "").replace(/<[^>]*>/g, "").match(/\b\d{6}\b/);
       res.json({ code: match ? match[0] : null });
     } else {
@@ -475,7 +525,7 @@ app.post("/cloud/v1/manualRegister", auth, async (req, res) => {
   try {
     await raccoonFetch("/users/emailRegister", { method: "POST", headers: REGISTER_HEADERS, body: new URLSearchParams({ email, code, password, phone: phone || "1", country: country || "Brazil", ...base }) });
     const loginRes = await raccoonFetch("/users/emailLogin", { method: "POST", headers: REGISTER_HEADERS, body: new URLSearchParams({ email, password, ...base }) });
-    const loginData = await loginRes.json();
+    const loginData = await parseJson(loginRes, "Raccoon login");
     if (loginData.status !== 200) throw new Error("Login failed");
     let userToken = loginData.data?.user_token || "";
     const cookie = loginRes.headers.get("set-cookie");
