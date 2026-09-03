@@ -47,6 +47,10 @@ async function fetchWithTimeout(url, opts = {}, ms = RACCOON_TIMEOUT_MS) {
 // "Unexpected end of JSON input" that players were seeing. This surfaces a
 // message both the player and the Render logs can actually read.
 async function parseJson(res, what) {
+  // A non-2xx is almost always the provider throttling THIS instance's IP
+  // (429) or blocking it (403) — surface the status so Render logs tell us
+  // exactly which case we're in instead of a vague message.
+  if (!res.ok) throw new Error(`${what} returned HTTP ${res.status} — the service may be blocking this server's IP. Redeploy to get a fresh one.`);
   const text = await res.text();
   if (!text) throw new Error(`${what} is under heavy load right now and sent no response — try again in a moment.`);
   try { return JSON.parse(text); }
@@ -138,7 +142,10 @@ async function getVerificationCode(mailJwt, base, maxRetries = 30) {
   }
   throw new Error("Timeout getting verification code");
 }
-const POOL_TARGET = 10;
+// Warm pool size. Tunable via GHOSTCLOUD_POOL_TARGET (default 10) — drop it to
+// 4-5 while the mail provider is throttling this IP, raise it when things are
+// healthy. Each account in the pool is one registration already banked.
+const POOL_TARGET = Math.min(Math.max(parseInt(process.env.GHOSTCLOUD_POOL_TARGET || "10", 10) || 10, 3), 20);
 const pool = [];
 let poolFilling = false;
 async function fillPool() {
