@@ -54,20 +54,6 @@ async function raccoonFetch(pathAndQuery, opts = {}) {
     return fetchWithTimeout(`https://${RACCOON_HOST}${pathAndQuery}`, opts);
   }
 }
-
-// Guarded JSON helper for the mail service — surfaces HTTP status / empty bodies
-// in logs so an IP block (403), rate limit (429), or service outage is easy to
-// tell apart instead of a cryptic "Unexpected end of JSON input".
-async function mailJson(path, opts = {}, what = path) {
-  let res;
-  try { res = await fetchWithTimeout(`${MAIL_BASE}${path}`, opts, 15000); }
-  catch (e) { throw new Error(`mail: ${what} unreachable (${e.message})`); }
-  if (!res.ok) throw new Error(`mail: ${what} HTTP ${res.status}`);
-  const text = await res.text();
-  if (!text) throw new Error(`mail: ${what} empty response`);
-  try { return JSON.parse(text); }
-  catch { throw new Error(`mail: ${what} bad JSON`); }
-}
 const sessions = new Map();
 const siteUsage = new Map();
 const ipLimits = new Map();
@@ -106,68 +92,28 @@ async function getVerificationCode(mailJwt, maxRetries = 30) {
   }
   throw new Error("Timeout getting verification code");
 }
-// Warm pool size — tunable via GHOSTCLOUD_POOL_TARGET env (Render → Environment).
-// Each concurrent player burns one temp account, so a bigger pool = more instant starts.
-// Keep it modest: the mail provider rate-limits registrations per IP, and every
-// account in the pool is one registration we've already been allowed.
-const POOL_TARGET = Math.min(Math.max(parseInt(process.env.GHOSTCLOUD_POOL_TARGET || "15", 10) || 15, 5), 30);
+const POOL_TARGET = 10;
 const pool = [];
 let poolFilling = false;
-
-// ── Global account-creation queue ──────────────────────────
-// The mail provider 429s bursts of parallel registrations from one IP (that's
-// what the logs showed). EVERY registration — pool fill AND on-demand from
-// sessions — goes through ONE queue, so at most one is ever in flight per
-// instance. This matches the old serial cadence that worked for weeks.
-let creationChain = Promise.resolve();
-function serialCreateAccount() {
-  const run = creationChain.then(() => createAccountRaw(), () => createAccountRaw());
-  creationChain = run.catch(() => {});
-  return run;
-}
-// Is any live session stuck waiting for an account right now? If so, pool fill
-// yields so the waiting player gets the next registration slot instead of the pool.
-function anySessionWaitingForAccount() {
-  for (const s of sessions.values()) if (s.state === "creating" && !s.sn) return true;
-  return false;
-}
 async function fillPool() {
   if (poolFilling) return;
   const needed = POOL_TARGET - pool.length;
   if (needed <= 0) return;
   poolFilling = true;
   try {
-    // Serial fill (one at a time). A burst is what gets us throttled.
     let errors = 0;
     for (let i = 0; i < needed; i++) {
-      if (anySessionWaitingForAccount()) break; // let a player take the next slot
-      try {
-        const acc = await serialCreateAccount();
-        pool.push(acc);
-        errors = 0;
-        console.log(`pool: ready (${pool.length}/${POOL_TARGET})`);
-      } catch (e) {
-        console.log(`pool: fill error — ${e.message}`);
-        if (++errors >= 5) break; // rest; the self-heal timer retries later
-        // 429 = provider throttling this IP — stop poking it for a while
-        const wait = /429/.test(e.message) ? 30000 : 3000;
-        await new Promise((r) => setTimeout(r, wait));
-      }
+      try { const acc = await createAccountRaw(); pool.push(acc); errors = 0; console.log(`pool: ready (${pool.length}/${POOL_TARGET})`); }
+      catch (e) { console.log(`pool: fill error — ${e.message}`); if (++errors >= 3) break; await new Promise((r) => setTimeout(r, 3000)); }
     }
   } finally { poolFilling = false; }
 }
-// Self-heal: if the pool ever falls short (throttle window / provider hiccup),
-// keep refilling gently in the background so the server recovers without a restart.
-setInterval(() => { if (pool.length < POOL_TARGET) fillPool().catch(() => {}); }, 60000);
 async function createAccount() {
   if (pool.length > 0) { const acc = pool.shift(); console.log(`pool: served (${pool.length} left)`); fillPool().catch(() => {}); return acc; }
-  // Pool empty — take the next slot on the global queue (serialized with pool fill)
-  const acc = await serialCreateAccount();
-  fillPool().catch(() => {});
-  return acc;
+  const acc = await createAccountRaw(); fillPool().catch(() => {}); return acc;
 }
 async function createAccountRaw() {
-  const domainData = await mailJson("/domains", {}, "domains");
+  const domainData = await (await fetchWithTimeout(`${MAIL_BASE}/domains`)).json();
   if (!domainData["hydra:member"]?.length) throw new Error("No Mail.tm domains available");
   const domain = domainData["hydra:member"][0].domain;
   const mailUser = `rcn_${Math.random().toString(36).substring(2, 11)}`;
@@ -177,8 +123,9 @@ async function createAccountRaw() {
   const sn = generateSN();
   const h = { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Mozilla/5.0 Chrome/147.0.0.0 Safari/537.36" };
   const base = { sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web" };
-  await mailJson("/accounts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) }, "create mailbox");
-  const { token: mailJwt } = await mailJson("/token", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) }, "mail token");
+  await fetchWithTimeout(`${MAIL_BASE}/accounts`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) });
+  const tokenRes = await fetchWithTimeout(`${MAIL_BASE}/token`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) });
+  const { token: mailJwt } = await tokenRes.json();
   await raccoonFetch("/users/sendEmail", { method: "POST", headers: h, body: new URLSearchParams({ email, type: "register", ...base }) });
   const code = await getVerificationCode(mailJwt);
   await raccoonFetch("/users/emailRegister", { method: "POST", headers: h, body: new URLSearchParams({ email, code, password: raccoonPassword, phone: "1", country: "Brazil", ...base }) });
@@ -193,12 +140,6 @@ async function createAccountRaw() {
 function gameHeaders(token) {
   return { accept: "*/*", "content-type": "application/x-www-form-urlencoded; charset=UTF-8", cookie: `as_user_token=${token}`, origin: "https://www.raccoongame.com", referer: "https://www.raccoongame.com/?t=1720436119", "user-agent": "Mozilla/5.0 Chrome/147.0.0.0 Safari/537.36", "x-requested-with": "XMLHttpRequest" };
 }
-// Games Raccoon marks as membership-only (status 4623) can never be played by
-// temp accounts — remember them so we fail fast instead of burning an account
-// on them every time someone clicks Play. Cache expires after 6h (games can change).
-const MEMBERSHIP_GAME_MSG = "This game requires a paid membership on the game service — temporary accounts can't play it. Try another game.";
-const MEMBERSHIP_BLOCK_TTL = 6 * 3600 * 1000;
-const membershipBlockedGames = new Map(); // game_key -> expiresAt
 async function doInitGame(session) {
   const { sn, token, game_key } = session;
   const h = gameHeaders(token);
@@ -213,12 +154,6 @@ async function doInitGame(session) {
   if (playData.status === 3004 || String(playData.msg || "").toLowerCase().includes("diamond")) {
     const err = new Error("This game needs play credits the temporary account doesn't have — try again in a moment or pick another game.");
     err.isDiamondError = true;
-    throw err;
-  }
-  // Raccoon status 4623 = this game needs a paid membership — no temp account can play it
-  if (playData.status === 4623 || /membership/i.test(String(playData.msg || ""))) {
-    const err = new Error(MEMBERSHIP_GAME_MSG);
-    err.isMembershipError = true;
     throw err;
   }
   if (playData.status === 201 || (playData.status === 200 && playData.data?.play_queue_id)) {
@@ -286,6 +221,7 @@ function killSession(uuid, reason = "unknown") {
   try { session.clientWs?.close(1000, reason); } catch {}
   doStopGame(session).catch(() => {});
   sessions.delete(uuid);
+  drainCapacityQueue(); // a slot freed — start the next player in line
   console.log(`session ${uuid.slice(0, 8)} killed — ${reason}`);
 }
 function resetPingTimeout(uuid) { const session = sessions.get(uuid); if (!session) return; clearTimeout(session.ping_timeout); session.ping_timeout = setTimeout(() => killSession(uuid, "ping_timeout"), 30000); }
@@ -365,6 +301,9 @@ const FREE_HOST_SUFFIXES = [
 function originAllowed(req, site) {
   const origin = req.headers.origin;
   if (!origin) return true; // non-browser clients (curl, server-to-server) with a valid key
+  // Opt-in escape hatch for fresh/custom domains (best answer to site blockers):
+  // when a site sets allow_all_origins: true, ANY browser origin is accepted.
+  if (site.allow_all_origins === true) return true;
   const allowed = site.allowed_origins || [];
   if (allowed.includes("*") || allowed.includes(origin)) return true;
   const list = site.allow_free_hosts ? allowed.concat(FREE_HOST_SUFFIXES) : allowed;
@@ -478,13 +417,14 @@ function registerBase(sn) { return { sn, model: "Chrome/147.0.0.0", version_code
 // Create a mail.gw mailbox — Raccoon actually delivers verification mail to these domains
 // (unlike temp-mail.org, which Raccoon silently drops).
 async function createMailbox() {
-  const domainData = await mailJson("/domains", {}, "domains");
+  const domainData = await (await fetchWithTimeout(`${MAIL_BASE}/domains`)).json();
   if (!domainData["hydra:member"]?.length) throw new Error("No mail domains available");
   const domain = domainData["hydra:member"][0].domain;
   const email = `rcn_${Math.random().toString(36).substring(2, 11)}@${domain}`;
   const mailPassword = generatePassword();
-  await mailJson("/accounts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) }, "create mailbox");
-  const { token: mailJwt } = await mailJson("/token", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) }, "mail token");
+  await fetchWithTimeout(`${MAIL_BASE}/accounts`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) });
+  const tokenRes = await fetchWithTimeout(`${MAIL_BASE}/token`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) });
+  const { token: mailJwt } = await tokenRes.json();
   return { email, mailJwt };
 }
 
@@ -545,23 +485,85 @@ app.post("/cloud/v1/manualRegister", auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+
+// ---- Server-capacity queue -------------------------------------------------
+// When the concurrent-session cap is reached we DON'T reject the player with
+// an error. They enter a FIFO line (live capacity_queue status + position) and
+// their session starts automatically the moment a slot frees. killSession() is
+// the single place sessions die, so it is the drain point.
+const capacityWaiters = []; // FIFO of { req, res, apiKey, site, game_key, manualAccount, enqueuedAt, ended, push }
+function enqueueCapacityWaiter(req, res, ctx) {
+  if (!res.headersSent) {
+    res.setHeader("Content-Type", "application/x-ndjson");
+    res.setHeader("Transfer-Encoding", "chunked");
+    res.setHeader("Cache-Control", "no-cache");
+    res.flushHeaders();
+  }
+  const waiter = { ...ctx, enqueuedAt: Date.now(), ended: false };
+  waiter.push = (obj) => { if (!res.writableEnded) res.write(JSON.stringify(obj) + "\n"); };
+  res.on("close", () => {
+    if (waiter.ended) return;
+    waiter.ended = true; // player closed / cancelled while waiting in line - drop them
+    const idx = capacityWaiters.indexOf(waiter);
+    if (idx >= 0) capacityWaiters.splice(idx, 1);
+  });
+  capacityWaiters.push(waiter);
+  broadcastCapacityQueue(); // immediate first position event so the client shows the line
+  return waiter;
+}
+function broadcastCapacityQueue() {
+  const now = Date.now();
+  for (let i = 0; i < capacityWaiters.length; i++) {
+    const w = capacityWaiters[i];
+    if (w.ended) continue;
+    w.push({ status: "capacity_queue", position: i + 1, waited_seconds: Math.floor((now - w.enqueuedAt) / 1000) });
+  }
+}
+function drainCapacityQueue() {
+  for (;;) {
+    const w = capacityWaiters.find((x) => !x.ended);
+    if (!w) break;
+    if (countActiveSessions(w.apiKey) >= w.site.max_concurrent_sessions) break;
+    capacityWaiters.splice(capacityWaiters.indexOf(w), 1);
+    w.ended = true;
+    w.push({ status: "slot_reserved" }); // stream continues straight into the normal create flow
+    runCreateSessionFlow(w.req, w.res, w);
+  }
+}
+// Keep line positions fresh every 4s while players wait.
+setInterval(broadcastCapacityQueue, 4000);
+
 app.post("/cloud/v1/createSession", auth, async (req, res) => {
   const { game_key, account } = req.body;
   if (!game_key || typeof game_key !== "string" || game_key.length > 256) return res.status(400).json({ error: "Invalid game_key." });
   const manualAccount = account && typeof account.sn === "string" && typeof account.token === "string" && account.sn && account.token ? account : null;
   const { site, apiKey } = req;
-  // Known membership-only games fail fast (no account wasted). Manual accounts
-  // (user's own, possibly with a membership) are still allowed through.
-  if (!manualAccount && (membershipBlockedGames.get(game_key) || 0) > Date.now()) {
-    return res.status(409).json({ error: MEMBERSHIP_GAME_MSG });
+  // No free slot -> join the line instead of a "server busy" error. The game
+  // starts automatically the moment a slot frees (drainCapacityQueue).
+  if (countActiveSessions(apiKey) >= site.max_concurrent_sessions) {
+    enqueueCapacityWaiter(req, res, { apiKey, site, game_key, manualAccount });
+    return;
   }
-  if (countActiveSessions(apiKey) >= site.max_concurrent_sessions) return res.status(429).json({ error: "Concurrent session limit reached." });
-  const rl = checkRateLimit(apiKey, site); if (!rl.allowed) return res.status(429).json({ error: `Rate limit: ${rl.reason}` });
-  if (!manualAccount && !acquireAccountSlot(apiKey, site)) return res.status(429).json({ error: "Too many sessions being created." });
-  res.setHeader("Content-Type", "application/x-ndjson");
-  res.setHeader("Transfer-Encoding", "chunked");
-  res.setHeader("Cache-Control", "no-cache");
-  res.flushHeaders();
+  runCreateSessionFlow(req, res, { apiKey, site, game_key, manualAccount });
+});
+
+async function runCreateSessionFlow(req, res, ctx) {
+  const { apiKey, site, game_key, manualAccount } = ctx;
+  const rl = checkRateLimit(apiKey, site);
+  if (!rl.allowed) {
+    if (res.headersSent) { res.write(JSON.stringify({ status: "error", error: `Rate limit: ${rl.reason}` }) + "\n"); res.end(); return; }
+    return res.status(429).json({ error: `Rate limit: ${rl.reason}` });
+  }
+  if (!manualAccount && !acquireAccountSlot(apiKey, site)) {
+    if (res.headersSent) { res.write(JSON.stringify({ status: "error", error: "Too many sessions being created." }) + "\n"); res.end(); return; }
+    return res.status(429).json({ error: "Too many sessions being created." });
+  }
+  if (!res.headersSent) {
+    res.setHeader("Content-Type", "application/x-ndjson");
+    res.setHeader("Transfer-Encoding", "chunked");
+    res.setHeader("Cache-Control", "no-cache");
+    res.flushHeaders();
+  }
   const push = (obj) => res.write(JSON.stringify(obj) + "\n");
   const uuid = randomUUID();
   const rawLimit = site.max_session_seconds && site.max_session_seconds > 0 ? site.max_session_seconds : DEFAULT_SESSION_SECONDS;
@@ -585,25 +587,7 @@ app.post("/cloud/v1/createSession", auth, async (req, res) => {
       push({ status: "account_ready" });
     } else {
       push({ status: "creating_account" });
-      // The mail provider throttles per IP (429) and during a throttle window
-      // only allows a trickle of registrations. Instead of dying on the first
-      // 429, wait through a few spaced retries so the session catches the next
-      // allowed slot. (Serial queue means these can't stack into a burst.)
-      let accTries = 0;
-      while (true) {
-        try {
-          acc = await createAccount();
-          break;
-        } catch (e) {
-          if (e && e.cancelled) throw e;
-          if (++accTries > 3) throw e;
-          console.log(`account throttled on ${uuid.slice(0, 8)} — retry ${accTries}/3`);
-          await new Promise((r) => setTimeout(r, 15000));
-          if (!sessions.has(uuid)) return res.end(); // player left during the wait
-          push({ status: "creating_account" });
-        }
-      }
-      releaseAccountSlot(apiKey);
+      acc = await createAccount(); releaseAccountSlot(apiKey);
       if (!sessions.has(uuid)) return res.end();
       push({ status: "account_ready" });
     }
@@ -641,14 +625,10 @@ app.post("/cloud/v1/createSession", auth, async (req, res) => {
       session.startgame_timeout = setTimeout(() => killSession(uuid, "startgame_timeout"), 30000);
       push({ status: "finished_queue", uuid, fetch_this_within_30s_or_terminate: "/cloud/v1/startGame" });
     }
-  } catch (e) {
-    if (!manualAccount) releaseAccountSlot(apiKey);
-    if (e && e.isMembershipError && !manualAccount) membershipBlockedGames.set(game_key, Date.now() + MEMBERSHIP_BLOCK_TTL);
-    push({ status: "error", error: e.message }); killSession(uuid, "creation_error");
-  }
+  } catch (e) { if (!manualAccount) releaseAccountSlot(apiKey); push({ status: "error", error: e.message }); killSession(uuid, "creation_error"); }
   streamEnded = true;
   res.end();
-});
+}
 app.get("/cloud/v1/getQueue", auth, async (req, res) => {
   const { uuid } = req.query; if (!uuid) return res.status(400).json({ error: "Missing uuid." });
   const session = sessions.get(uuid); if (!session) return res.status(404).json({ error: "Not found." });
