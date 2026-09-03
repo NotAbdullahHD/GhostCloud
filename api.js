@@ -148,6 +148,7 @@ async function getVerificationCode(mailJwt, base, maxRetries = 30) {
 const POOL_TARGET = Math.min(Math.max(parseInt(process.env.GHOSTCLOUD_POOL_TARGET || "10", 10) || 10, 3), 20);
 const pool = [];
 let poolFilling = false;
+let lastFarmPushAt = 0; // when the off-server account farm last pushed accounts
 async function fillPool() {
   if (poolFilling) return;
   const needed = POOL_TARGET - pool.length;
@@ -163,6 +164,13 @@ async function fillPool() {
 }
 async function createAccount() {
   if (pool.length > 0) { const acc = pool.shift(); console.log(`pool: served (${pool.length} left)`); fillPool().catch(() => {}); return acc; }
+  // Farm refill grace: if the off-server farm is actively pushing accounts,
+  // give it a few seconds to refill before falling back to (throttled)
+  // server-side creation — which usually fails fast when Render's IP is flagged.
+  if (lastFarmPushAt && Date.now() - lastFarmPushAt < 60000) {
+    for (let w = 0; w < 8 && pool.length === 0; w++) await new Promise((r) => setTimeout(r, 1000));
+    if (pool.length > 0) { const acc = pool.shift(); console.log(`pool: served (${pool.length} left)`); fillPool().catch(() => {}); return acc; }
+  }
   const acc = await createAccountRaw(); fillPool().catch(() => {}); return acc;
 }
 async function createAccountRaw() {
@@ -397,6 +405,57 @@ app.use((req, res, next) => {
 app.use(express.static(path.join(__dirname, "public")));
 // Health check for hosting platforms (Render/Railway) that require a 200 on /
 app.get("/healthz", (req, res) => res.json({ status: "ok", name: "ghostcloud-api" }));
+// Diagnostic: shows EXACTLY how the mail provider responds to THIS instance's
+// IP (429 = throttled, 403 = blocked, 200 + empty body = throttled, timeout =
+// unreachable). Open it in a browser:
+//   https://<your-service>.onrender.com/cloud/v1/diagMail?api_key=sk_live_local_dev_key_12345
+app.get("/cloud/v1/diagMail", auth, async (req, res) => {
+  const out = { provider: MAIL_PROVIDERS[0], note: "", domains: null };
+  try {
+    const t0 = Date.now();
+    const r = await fetchWithTimeout(`${MAIL_PROVIDERS[0]}/domains`, {}, 15000);
+    const text = await r.text();
+    out.domains = { status: r.status, ms: Date.now() - t0, body_len: text.length, body_head: text.slice(0, 120) };
+    if (r.status === 429) out.note = "THROTTLED — the IP is rate-limited. May clear on its own in hours; redeploy to try a fresh IP.";
+    else if (r.status === 403) out.note = "BLOCKED — mail.gw refuses this IP outright. Redeploys won't help if the whole range is blocked.";
+    else if (r.ok && text.length === 0) out.note = "THROTTLED — 200 with empty body. Same as 429, just uglier.";
+    else if (r.ok) out.note = "HEALTHY — this instance's IP can reach the mail provider.";
+  } catch (e) { out.domains = { error: e.message }; out.note = "UNREACHABLE — connection-level failure to the mail provider."; }
+  res.json(out);
+});
+// ── Account farm (off-server account creation) ──────────────────────────────
+// When Render's egress IP is flagged by the mail provider, the server can't
+// create accounts itself. The farm is a small script run on a network the
+// provider does NOT flag (your home PC): it creates { sn, token } accounts and
+// pushes them here to keep the pool full. Guarded by its own secret
+// (GHOSTCLOUD_FARM_KEY env) so visitors can't poison the pool with the public
+// API key.
+const FARM_KEY = process.env.GHOSTCLOUD_FARM_KEY || "";
+if (!FARM_KEY) console.log("ℹ️  GHOSTCLOUD_FARM_KEY is not set — account farm disabled. Set it in Render → Environment only if Render's IP is blocked by the mail provider.");
+const farmAuthed = (req) => !!FARM_KEY && req.headers["x-farm-key"] === FARM_KEY;
+app.get("/cloud/v1/farmStatus", (req, res) => {
+  if (!farmAuthed(req)) return res.status(401).json({ error: "Bad or missing farm key." });
+  res.json({ pool: pool.length, target: POOL_TARGET });
+});
+app.post("/cloud/v1/farmPush", (req, res) => {
+  if (!farmAuthed(req)) return res.status(401).json({ error: "Bad or missing farm key." });
+  const list = Array.isArray((req.body || {}).accounts) ? req.body.accounts : [];
+  let accepted = 0;
+  let rejected = 0;
+  for (const a of list) {
+    const sn = String((a || {}).sn || "");
+    const token = String((a || {}).token || "");
+    if (!/^[0-9a-f]{32}$/.test(sn) || !token || token.length > 200) { rejected++; continue; }
+    if (pool.length >= POOL_TARGET) break;
+    pool.push({ sn, token, farmed: true });
+    accepted++;
+  }
+  if (accepted) {
+    lastFarmPushAt = Date.now();
+    console.log(`farm: +${accepted} accounts (pool ${pool.length}/${POOL_TARGET})`);
+  }
+  res.json({ accepted, rejected, pool: pool.length, target: POOL_TARGET });
+});
 app.get("/cloud/v1/embed", (req, res) => { if (!req.query.id) return res.status(400).type("text").send("Missing id"); res.sendFile(path.join(__dirname, "public", "e.html")); });
 app.get("/cloud/v1/embed-data", (req, res) => {
   const ip = getClientIp(req);
