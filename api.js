@@ -50,7 +50,7 @@ async function parseJson(res, what) {
   // A non-2xx is almost always the provider throttling THIS instance's IP
   // (429) or blocking it (403) — surface the status so Render logs tell us
   // exactly which case we're in instead of a vague message.
-  if (!res.ok) throw new Error(`${what} returned HTTP ${res.status} — the service may be blocking this server's IP. Redeploy to get a fresh one.`);
+  if (!res.ok) throw new Error(`${what} is at capacity right now (HTTP ${res.status}) — please try again in a moment.`);
   const text = await res.text();
   if (!text) throw new Error(`${what} is under heavy load right now and sent no response — try again in a moment.`);
   try { return JSON.parse(text); }
