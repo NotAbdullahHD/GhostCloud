@@ -50,7 +50,12 @@ async function parseJson(res, what) {
   // A non-2xx is almost always the provider throttling THIS instance's IP
   // (429) or blocking it (403) — surface the status so Render logs tell us
   // exactly which case we're in instead of a vague message.
-  if (!res.ok) throw new Error(`${what} is at capacity right now (HTTP ${res.status}) — please try again in a moment.`);
+  if (!res.ok) {
+    // 5xx = the provider itself is sick (gateway outage) — not this instance's IP.
+    // 4xx = this instance's IP is throttled (429) or blocked (403) by the provider.
+    if (res.status >= 500) throw new Error(`${what} is briefly unavailable right now (HTTP ${res.status}) — try again in a moment.`);
+    throw new Error(`${what} is at capacity right now (HTTP ${res.status}) — please try again in a moment.`);
+  }
   const text = await res.text();
   if (!text) throw new Error(`${what} is under heavy load right now and sent no response — try again in a moment.`);
   try { return JSON.parse(text); }
@@ -148,7 +153,6 @@ async function getVerificationCode(mailJwt, base, maxRetries = 30) {
 const POOL_TARGET = Math.min(Math.max(parseInt(process.env.GHOSTCLOUD_POOL_TARGET || "10", 10) || 10, 3), 20);
 const pool = [];
 let poolFilling = false;
-let lastFarmPushAt = 0; // when the off-server account farm last pushed accounts
 async function fillPool() {
   if (poolFilling) return;
   const needed = POOL_TARGET - pool.length;
@@ -164,13 +168,6 @@ async function fillPool() {
 }
 async function createAccount() {
   if (pool.length > 0) { const acc = pool.shift(); console.log(`pool: served (${pool.length} left)`); fillPool().catch(() => {}); return acc; }
-  // Farm refill grace: if the off-server farm is actively pushing accounts,
-  // give it a few seconds to refill before falling back to (throttled)
-  // server-side creation — which usually fails fast when Render's IP is flagged.
-  if (lastFarmPushAt && Date.now() - lastFarmPushAt < 60000) {
-    for (let w = 0; w < 8 && pool.length === 0; w++) await new Promise((r) => setTimeout(r, 1000));
-    if (pool.length > 0) { const acc = pool.shift(); console.log(`pool: served (${pool.length} left)`); fillPool().catch(() => {}); return acc; }
-  }
   const acc = await createAccountRaw(); fillPool().catch(() => {}); return acc;
 }
 async function createAccountRaw() {
@@ -178,33 +175,43 @@ async function createAccountRaw() {
   // (replies success, drops the mail), so we request the code up to 2 times per
   // mailbox before moving on to the next provider. A provider that keeps
   // failing gets skipped for 5 minutes so we stop wasting time on it.
+  // Whole-pass retries: a sick provider (5xx, e.g. a gateway outage) usually
+  // recovers within a minute, so retry the full pass with backoff before
+  // surfacing an error to the player.
+  const passBackoffMs = [3000, 8000, 20000];
   let lastErr = null;
-  for (const base of providerOrder()) {
-    try {
-      const { email, mailJwt } = await createMailboxOn(base);
-      const raccoonPassword = generatePassword();
-      const sn = generateSN();
-      const h = { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Mozilla/5.0 Chrome/147.0.0.0 Safari/537.36" };
-      const common = { sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web" };
-      let code = null;
-      for (let attempt = 0; attempt < 2 && !code; attempt++) {
-        await raccoonFetch("/users/sendEmail", { method: "POST", headers: h, body: new URLSearchParams({ email, type: "register", ...common }) });
-        try { code = await getVerificationCode(mailJwt, base, 17); } // ~50s per send attempt
-        catch (e) { lastErr = e; }
+  for (let pass = 0; pass <= passBackoffMs.length; pass++) {
+    for (const base of providerOrder()) {
+      try {
+        const { email, mailJwt } = await createMailboxOn(base);
+        const raccoonPassword = generatePassword();
+        const sn = generateSN();
+        const h = { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Mozilla/5.0 Chrome/147.0.0.0 Safari/537.36" };
+        const common = { sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web" };
+        let code = null;
+        for (let attempt = 0; attempt < 2 && !code; attempt++) {
+          await raccoonFetch("/users/sendEmail", { method: "POST", headers: h, body: new URLSearchParams({ email, type: "register", ...common }) });
+          try { code = await getVerificationCode(mailJwt, base, 17); } // ~50s per send attempt
+          catch (e) { lastErr = e; }
+        }
+        if (!code) { noteProviderFail(base); continue; }
+        await raccoonFetch("/users/emailRegister", { method: "POST", headers: h, body: new URLSearchParams({ email, code, password: raccoonPassword, phone: "1", country: "Brazil", ...common }) });
+        const loginRes = await raccoonFetch("/users/emailLogin", { method: "POST", headers: h, body: new URLSearchParams({ email, password: raccoonPassword, ...common }) });
+        const loginData = await parseJson(loginRes, "Raccoon login");
+        if (loginData.status !== 200) { noteProviderFail(base); throw new Error("Login failed"); }
+        let userToken = loginData.data?.user_token || "";
+        const cookie = loginRes.headers.get("set-cookie");
+        if (cookie) { const m = cookie.match(/as_user_token=([^;]+)/); if (m) userToken = m[1]; }
+        noteProviderOk(base);
+        return { sn, token: userToken };
+      } catch (e) {
+        lastErr = e;
+        noteProviderFail(base);
       }
-      if (!code) { noteProviderFail(base); continue; }
-      await raccoonFetch("/users/emailRegister", { method: "POST", headers: h, body: new URLSearchParams({ email, code, password: raccoonPassword, phone: "1", country: "Brazil", ...common }) });
-      const loginRes = await raccoonFetch("/users/emailLogin", { method: "POST", headers: h, body: new URLSearchParams({ email, password: raccoonPassword, ...common }) });
-      const loginData = await parseJson(loginRes, "Raccoon login");
-      if (loginData.status !== 200) { noteProviderFail(base); throw new Error("Login failed"); }
-      let userToken = loginData.data?.user_token || "";
-      const cookie = loginRes.headers.get("set-cookie");
-      if (cookie) { const m = cookie.match(/as_user_token=([^;]+)/); if (m) userToken = m[1]; }
-      noteProviderOk(base);
-      return { sn, token: userToken };
-    } catch (e) {
-      lastErr = e;
-      noteProviderFail(base);
+    }
+    if (pass < passBackoffMs.length) {
+      console.log(`account creation failed (${lastErr.message}) — retrying in ${passBackoffMs[pass] / 1000}s`);
+      await new Promise((r) => setTimeout(r, passBackoffMs[pass]));
     }
   }
   throw lastErr || new Error("Account creation failed on all providers");
@@ -423,39 +430,7 @@ app.get("/cloud/v1/diagMail", auth, async (req, res) => {
   } catch (e) { out.domains = { error: e.message }; out.note = "UNREACHABLE — connection-level failure to the mail provider."; }
   res.json(out);
 });
-// ── Account farm (off-server account creation) ──────────────────────────────
-// When Render's egress IP is flagged by the mail provider, the server can't
-// create accounts itself. The farm is a small script run on a network the
-// provider does NOT flag (your home PC): it creates { sn, token } accounts and
-// pushes them here to keep the pool full. Guarded by its own secret
-// (GHOSTCLOUD_FARM_KEY env) so visitors can't poison the pool with the public
-// API key.
-const FARM_KEY = process.env.GHOSTCLOUD_FARM_KEY || "";
-if (!FARM_KEY) console.log("ℹ️  GHOSTCLOUD_FARM_KEY is not set — account farm disabled. Set it in Render → Environment only if Render's IP is blocked by the mail provider.");
-const farmAuthed = (req) => !!FARM_KEY && req.headers["x-farm-key"] === FARM_KEY;
-app.get("/cloud/v1/farmStatus", (req, res) => {
-  if (!farmAuthed(req)) return res.status(401).json({ error: "Bad or missing farm key." });
-  res.json({ pool: pool.length, target: POOL_TARGET });
-});
-app.post("/cloud/v1/farmPush", (req, res) => {
-  if (!farmAuthed(req)) return res.status(401).json({ error: "Bad or missing farm key." });
-  const list = Array.isArray((req.body || {}).accounts) ? req.body.accounts : [];
-  let accepted = 0;
-  let rejected = 0;
-  for (const a of list) {
-    const sn = String((a || {}).sn || "");
-    const token = String((a || {}).token || "");
-    if (!/^[0-9a-f]{32}$/.test(sn) || !token || token.length > 200) { rejected++; continue; }
-    if (pool.length >= POOL_TARGET) break;
-    pool.push({ sn, token, farmed: true });
-    accepted++;
-  }
-  if (accepted) {
-    lastFarmPushAt = Date.now();
-    console.log(`farm: +${accepted} accounts (pool ${pool.length}/${POOL_TARGET})`);
-  }
-  res.json({ accepted, rejected, pool: pool.length, target: POOL_TARGET });
-});
+
 app.get("/cloud/v1/embed", (req, res) => { if (!req.query.id) return res.status(400).type("text").send("Missing id"); res.sendFile(path.join(__dirname, "public", "e.html")); });
 app.get("/cloud/v1/embed-data", (req, res) => {
   const ip = getClientIp(req);
@@ -835,6 +810,11 @@ setInterval(() => {
   for (const [ip, timestamps] of ipLimits.entries()) { const recent = timestamps.filter((t) => t > cutoff); if (recent.length === 0) ipLimits.delete(ip); else ipLimits.set(ip, recent); }
   for (const [ip, timestamps] of embedIpLimits.entries()) { const recent = timestamps.filter((t) => t > cutoff); if (recent.length === 0) embedIpLimits.delete(ip); else embedIpLimits.set(ip, recent); }
 }, 60000);
+// Background refill: if the pool runs dry (provider outage, burst), keep
+// topping it up so it self-heals the moment the provider recovers — players
+// don't have to eat the per-account creation wait after an outage.
+setInterval(() => { fillPool().catch(() => {}); }, 20000);
+
 httpServer.listen(PORT, () => {
   console.log("");
   console.log(" 🔌 GhostCloud API server");
