@@ -102,7 +102,7 @@ function generatePassword() {
 // mail.tm-compatible mirror, another provider) and the code rotates through
 // them automatically, remembering which ones currently work.
 //   GHOSTCLOUD_MAIL_PROVIDERS="https://api.mail.gw,https://api.other.tld"
-const MAIL_PROVIDERS = (process.env.GHOSTCLOUD_MAIL_PROVIDERS || "https://api.mail.gw")
+const MAIL_PROVIDERS = (process.env.GHOSTCLOUD_MAIL_PROVIDERS || "https://api.mail.gw,https://api.duckmail.sbs")
   .split(",").map((s) => s.trim()).filter(Boolean);
 const providerHealth = new Map(); // base -> { fails, skipUntil }
 // Providers that aren't currently skipped, in config order. If EVERY provider
@@ -140,7 +140,8 @@ async function getVerificationCode(mailJwt, base, maxRetries = 30) {
       if (data["hydra:member"]?.length > 0) {
         const msgId = data["hydra:member"][0].id;
         const full = await parseJson(await fetchWithTimeout(`${base}/messages/${msgId}`, { headers }), "Mail service");
-        const match = (full.text || full.html || "").replace(/<[^>]*>/g, "").match(/\b\d{6}\b/);
+        const body = [full.text, ...(Array.isArray(full.html) ? full.html : [full.html])].filter(Boolean).join("\n");
+        const match = body.replace(/<[^>]*>/g, "").match(/\b\d{6}\b/);
         if (match) return match[0];
       }
     } catch {}
@@ -516,7 +517,12 @@ function registerBase(sn) { return { sn, model: "Chrome/147.0.0.0", version_code
 // provider on purpose: the client reads codes via /getCode which polls the
 // primary too, so the mailbox and the poll must agree.
 async function createMailbox() {
-  return createMailboxOn(MAIL_PROVIDERS[0]);
+  let lastErr = null;
+  for (const base of providerOrder()) {
+    try { return await createMailboxOn(base); }
+    catch (e) { lastErr = e; noteProviderFail(base); }
+  }
+  throw lastErr || new Error("No mail provider available");
 }
 
 app.post("/cloud/v1/createMailbox", auth, async (req, res) => {
@@ -526,16 +532,18 @@ app.post("/cloud/v1/createMailbox", auth, async (req, res) => {
 
 // Single-poll read of the newest message's 6-digit code from a mailbox.
 app.post("/cloud/v1/getCode", auth, async (req, res) => {
-  const { mailJwt } = req.body;
+  const { mailJwt, base } = req.body;
   if (!mailJwt) return res.status(400).json({ error: "Missing mailJwt." });
+  const baseUrl = typeof base === "string" && MAIL_PROVIDERS.includes(base) ? base : MAIL_PROVIDERS[0];
   try {
     const headers = { Authorization: `Bearer ${mailJwt}`, "Content-Type": "application/json" };
-    const r = await fetchWithTimeout(`${MAIL_BASE}/messages?page=1`, { headers });
+    const r = await fetchWithTimeout(`${baseUrl}/messages?page=1`, { headers });
     const data = await parseJson(r, "Mail service");
     if (data["hydra:member"]?.length > 0) {
       const msgId = data["hydra:member"][0].id;
-      const full = await parseJson(await fetchWithTimeout(`${MAIL_BASE}/messages/${msgId}`, { headers }), "Mail service");
-      const match = (full.text || full.html || "").replace(/<[^>]*>/g, "").match(/\b\d{6}\b/);
+      const full = await parseJson(await fetchWithTimeout(`${baseUrl}/messages/${msgId}`, { headers }), "Mail service");
+      const body = [full.text, ...(Array.isArray(full.html) ? full.html : [full.html])].filter(Boolean).join("\n");
+      const match = body.replace(/<[^>]*>/g, "").match(/\b\d{6}\b/);
       res.json({ code: match ? match[0] : null });
     } else {
       res.json({ code: null });
