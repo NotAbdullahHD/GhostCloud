@@ -17,7 +17,6 @@ try {
 }
 const RACCOON_HOST = "www.raccoongame.com";
 const RACCOON_TIMEOUT_MS = 20000;
-const MAIL_BASE = "https://api.mail.gw";
 let raccoonIpCache = null;
 async function resolveRaccoonIp() {
   if (raccoonIpCache && raccoonIpCache.expiresAt > Date.now()) return raccoonIpCache;
@@ -95,58 +94,172 @@ function generatePassword() {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$";
   let p = ""; for (let i = 0; i < 12; i++) p += chars[Math.floor(Math.random() * chars.length)]; return p;
 }
-// ── Mail providers ──────────────────────────────────────────────────────────
-// Raccoon only DELIVERS verification mail to SOME temp-mail providers. mail.tm
-// and temp-mail.org reply "success" but silently drop the mail (tested), while
-// api.mail.gw delivers (tested ~12s). Add more provider bases to this list (a
-// mail.tm-compatible mirror, another provider) and the code rotates through
-// them automatically, remembering which ones currently work.
-//   GHOSTCLOUD_MAIL_PROVIDERS="https://api.mail.gw,https://api.other.tld"
-const MAIL_PROVIDERS = (process.env.GHOSTCLOUD_MAIL_PROVIDERS || "https://api.mail.gw,https://api.duckmail.sbs")
+// ── Mail lanes ──────────────────────────────────────────────────────────────
+// Raccoon is actively blocking disposable-mail DOMAINS: it now answers
+// {"status":400,"msg":"Temporary email addresses are not supported."} for the
+// domains it knows, and silently drops mail for ones it half-knows. So the mail
+// layer is a set of LANES, each one an independent way to get a mailbox we can
+// read a code from, tried in order of proven reliability:
+//   1. own-domain   (GHOSTCLOUD_MAIL_DOMAIN) — a real domain you own that a
+//      Cloudflare Email Worker pushes straight into this API. Nothing to block
+//      in advance and no polling, so this is the durable lane.
+//   2. tempmail.lol — free, no API key, hands out ROTATING SUB-DOMAINS, which
+//      makes blocklisting much harder. Verified delivering (full register+login).
+//   3. mail.tm-shaped bases (mail.gw, duckmail, mirrors) — mostly blocked now,
+//      kept as fallback and skipped automatically once their domains are known
+//      dead.
+//   GHOSTCLOUD_MAIL_PROVIDERS="https://api.duckmail.sbs,https://api.mail.gw"
+const MAIL_PROVIDERS = (process.env.GHOSTCLOUD_MAIL_PROVIDERS || "https://api.duckmail.sbs,https://api.mail.gw")
   .split(",").map((s) => s.trim()).filter(Boolean);
-const providerHealth = new Map(); // base -> { fails, skipUntil }
-// Providers that aren't currently skipped, in config order. If EVERY provider
-// is marked down, fall back to trying them all (better than nothing).
-function providerOrder() {
-  const now = Date.now();
-  const healthy = MAIL_PROVIDERS.filter((b) => { const h = providerHealth.get(b); return !h || h.skipUntil <= now; });
-  return healthy.length > 0 ? healthy : MAIL_PROVIDERS;
+// A domain Raccoon rejects is dead forever — remember it so we never burn 50s
+// waiting for mail that will never arrive.
+const blockedMailDomains = new Set();
+function isTempBlockedMessage(msg) {
+  return /temporary email|not supported|disposable/i.test(String(msg || ""));
 }
-function noteProviderOk(base) { providerHealth.delete(base); }
-function noteProviderFail(base) {
+function markDomainBlocked(email, why) {
+  const dom = String(email || "").split("@")[1];
+  if (!dom || !isTempBlockedMessage(why) || blockedMailDomains.has(dom)) return;
+  blockedMailDomains.add(dom);
+  console.log(`mail domain rejected by Raccoon (${why.trim()}) — ${dom} added to blocklist`);
+}
+// Raccoon replies HTTP 200 but puts a non-200 status in the body when it
+// refuses an address. Returns the message when refused, else null.
+function raccoonRejectedMail(data) {
+  if (!data || typeof data !== "object") return null;
+  if (data.status === 200 || data.status === 201) return null;
+  return String(data.msg || JSON.stringify(data).slice(0, 140));
+}
+const providerHealth = new Map(); // lane id -> { fails, skipUntil }
+const providerStats = new Map();  // lane id -> { ok, fail, lastErr, lastAt }
+function noteProviderOk(base) {
+  const wasSkipped = (providerHealth.get(base) || {}).skipUntil > Date.now();
+  providerHealth.delete(base);
+  if (wasSkipped) console.log(`mail provider ${base} healthy again — back in rotation`);
+  const st = providerStats.get(base) || { ok: 0, fail: 0, lastErr: null, lastAt: null };
+  st.ok += 1; st.lastErr = null; st.lastAt = Date.now();
+  providerStats.set(base, st);
+}
+function noteProviderFail(base, err) {
   const h = providerHealth.get(base) || { fails: 0, skipUntil: 0 };
   h.fails += 1;
   if (h.fails >= 3) { h.skipUntil = Date.now() + 5 * 60000; h.fails = 0; console.log(`mail provider ${base} failing — skipping for 5 min`); }
   providerHealth.set(base, h);
+  const st = providerStats.get(base) || { ok: 0, fail: 0, lastErr: null, lastAt: null };
+  st.fail += 1; st.lastErr = err ? err.message : null; st.lastAt = Date.now();
+  providerStats.set(base, st);
 }
-async function createMailboxOn(base) {
-  const domainData = await parseJson(await fetchWithTimeout(`${base}/domains`), "Account service");
-  if (!domainData["hydra:member"]?.length) throw new Error("No mail domains available");
-  const domain = domainData["hydra:member"][0].domain;
-  const email = `rcn_${Math.random().toString(36).substring(2, 11)}@${domain}`;
-  const mailPassword = generatePassword();
-  await fetchWithTimeout(`${base}/accounts`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) });
-  const { token: mailJwt } = await parseJson(await fetchWithTimeout(`${base}/token`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) }), "Account service");
-  return { email, mailJwt, base };
+// One compact line so you can see which mail lane is carrying the site at a
+// glance (and whether any lane is being skipped for 5 min).
+// Codes pushed in by the own-domain lane's Email Worker (address -> {code, at}).
+const inboundCodes = new Map();
+
+// tempmail.lol — free tier needs no API key and every inbox gets its own random
+// sub-domain (e.g. ryon94d165@rd.prominentghost.com), so one blocked sub-domain
+// doesn't kill the lane. Verified end-to-end against Raccoon.
+const TEMPMAILLOL_ENABLED = process.env.GHOSTCLOUD_TEMPMAILLOL !== "off";
+const tempmailLolLane = {
+  id: "tempmail.lol",
+  async create() {
+    const r = await fetchWithTimeout("https://api.tempmail.lol/v2/inbox/create", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }, 15000);
+    if (r.status === 429) throw new Error("tempmail.lol is rate limiting (HTTP 429)");
+    const d = await parseJson(r, "Account service");
+    if (!d.address || !d.token) throw new Error("tempmail.lol returned no mailbox");
+    return { email: d.address, handle: { lane: "tempmail.lol", mailToken: d.token } };
+  },
+  async read(handle) {
+    const r = await fetchWithTimeout(`https://api.tempmail.lol/v2/inbox?token=${encodeURIComponent(handle.mailToken)}`, {}, 15000);
+    if (!r.ok) return null;
+    const d = await r.json().catch(() => null);
+    for (const m of d?.emails || []) {
+      const match = String(m.body || m.html || "").replace(/<[^>]*>/g, " ").match(/\b\d{6}\b/);
+      if (match) return match[0];
+    }
+    return null;
+  },
+};
+
+// Own-domain lane: any address @GHOSTCLOUD_MAIL_DOMAIN is valid mail because the
+// domain's MX points at Cloudflare Email Routing, which forwards each message to
+// the Email Worker, which POSTs the code to /cloud/v1/inbound. Push, not poll —
+// the code is usually here before we even ask for it.
+const MAIL_DOMAIN = (process.env.GHOSTCLOUD_MAIL_DOMAIN || "").trim().toLowerCase();
+const domainLane = MAIL_DOMAIN ? {
+  id: `${MAIL_DOMAIN} (own domain)`,
+  async create() {
+    const email = `rcn_${Math.random().toString(36).substring(2, 11)}@${MAIL_DOMAIN}`;
+    return { email, handle: { lane: "domain", email } };
+  },
+  async read(handle) {
+    const hit = inboundCodes.get(String(handle.email || "").toLowerCase());
+    return hit ? hit.code : null;
+  },
+} : null;
+
+// mail.tm-shaped provider (mail.gw, duckmail, mirrors). Skips itself once every
+// domain it offers is known-blocked, so it stays cheap in the rotation.
+function mailtmLane(base) {
+  const id = base.replace(/^https?:\/\//, "");
+  return {
+    id, base,
+    async create() {
+      const domainData = await parseJson(await fetchWithTimeout(`${base}/domains`), "Account service");
+      const domains = (domainData["hydra:member"] || []).map((d) => d.domain).filter((d) => d && !blockedMailDomains.has(d));
+      if (!domains.length) throw new Error(blockedMailDomains.size ? "all of its domains are blocklisted by Raccoon" : "No mail domains available");
+      const email = `rcn_${Math.random().toString(36).substring(2, 11)}@${domains[0]}`;
+      const mailPassword = generatePassword();
+      await fetchWithTimeout(`${base}/accounts`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) });
+      const { token: mailJwt } = await parseJson(await fetchWithTimeout(`${base}/token`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: email, password: mailPassword }) }), "Account service");
+      return { email, handle: { lane: "mailtm", base, mailJwt } };
+    },
+    async read(handle) {
+      const headers = { Authorization: `Bearer ${handle.mailJwt}`, "Content-Type": "application/json" };
+      const data = await parseJson(await fetchWithTimeout(`${base}/messages?page=1`, { headers }), "Mail service");
+      if (!data["hydra:member"]?.length) return null;
+      const msgId = data["hydra:member"][0].id;
+      const full = await parseJson(await fetchWithTimeout(`${base}/messages/${msgId}`, { headers }), "Mail service");
+      const body = [full.text, ...(Array.isArray(full.html) ? full.html : [full.html])].filter(Boolean).join("\n");
+      const match = body.replace(/<[^>]*>/g, "").match(/\b\d{6}\b/);
+      return match ? match[0] : null;
+    },
+  };
 }
-async function getVerificationCode(mailJwt, base, maxRetries = 30) {
-  // base = the mail provider the mailbox was created on (rotation-aware)
-  const headers = { Authorization: `Bearer ${mailJwt}`, "Content-Type": "application/json" };
+
+// All lanes in priority order (durable/fastest first).
+function allLanes() {
+  const lanes = [];
+  if (domainLane) lanes.push(domainLane);
+  if (TEMPMAILLOL_ENABLED) lanes.push(tempmailLolLane);
+  MAIL_PROVIDERS.forEach((b) => lanes.push(mailtmLane(b)));
+  return lanes;
+}
+// Lanes that aren't currently skipped. If EVERY lane is marked down, fall back
+// to trying them all (better than nothing).
+function laneOrder() {
+  const now = Date.now();
+  const all = allLanes();
+  const healthy = all.filter((l) => { const h = providerHealth.get(l.id); return !h || h.skipUntil <= now; });
+  return healthy.length > 0 ? healthy : all;
+}
+function laneById(id) { return allLanes().find((l) => l.id === id) || null; }
+function providerDashboard() {
+  const parts = allLanes().map((l) => {
+    const st = providerStats.get(l.id);
+    const h = providerHealth.get(l.id);
+    const skipped = h && h.skipUntil > Date.now() ? " (skipped)" : "";
+    return `${l.id} ok=${st?.ok ?? 0} fail=${st?.fail ?? 0}${skipped}`;
+  });
+  const blocked = blockedMailDomains.size ? ` | raccoon-blocked domains: ${[...blockedMailDomains].join(",")}` : "";
+  return `providers: ${parts.join(" | ")} | pool ${pool.length}/${POOL_TARGET}${blocked}`;
+}
+// Poll one lane for the code. The first read is immediate so a push-based lane
+// (own domain) returns without waiting a single tick.
+async function pollCode(lane, handle, maxRetries = 17) {
   for (let i = 0; i < maxRetries; i++) {
+    try { const c = await lane.read(handle); if (c) return c; } catch {}
     await new Promise((r) => setTimeout(r, 3000));
-    try {
-      const res = await fetchWithTimeout(`${base}/messages?page=1`, { headers });
-      const data = await parseJson(res, "Mail service");
-      if (data["hydra:member"]?.length > 0) {
-        const msgId = data["hydra:member"][0].id;
-        const full = await parseJson(await fetchWithTimeout(`${base}/messages/${msgId}`, { headers }), "Mail service");
-        const body = [full.text, ...(Array.isArray(full.html) ? full.html : [full.html])].filter(Boolean).join("\n");
-        const match = body.replace(/<[^>]*>/g, "").match(/\b\d{6}\b/);
-        if (match) return match[0];
-      }
-    } catch {}
   }
-  throw new Error("Timeout getting verification code");
+  return null;
 }
 // Warm pool size. Tunable via GHOSTCLOUD_POOL_TARGET (default 10) — drop it to
 // 4-5 while the mail provider is throttling this IP, raise it when things are
@@ -172,46 +285,66 @@ async function createAccount() {
   const acc = await createAccountRaw(); fillPool().catch(() => {}); return acc;
 }
 async function createAccountRaw() {
-  // Try each provider in order. Raccoon's sendEmail is occasionally flaky
-  // (replies success, drops the mail), so we request the code up to 2 times per
-  // mailbox before moving on to the next provider. A provider that keeps
-  // failing gets skipped for 5 minutes so we stop wasting time on it.
-  // Whole-pass retries: a sick provider (5xx, e.g. a gateway outage) usually
+  // Try each lane in order. Two failure shapes worth short-circuiting:
+  //  - Raccoon answers "Temporary email addresses are not supported." → that
+  //    domain is blocklisted, so remember it and rotate INSTANTLY instead of
+  //    polling ~50s for mail that will never arrive.
+  //  - The code simply never arrives (silent drop). Raccoon's sendEmail is
+  //    occasionally flaky, so we ask up to twice per mailbox before giving up;
+  //    a lane that keeps failing is skipped for 5 min by the health tracker.
+  // Whole-pass retries: a sick lane (5xx, e.g. a gateway outage) usually
   // recovers within a minute, so retry the full pass with backoff before
   // surfacing an error to the player.
   const passBackoffMs = [3000, 8000, 20000];
   let lastErr = null;
   for (let pass = 0; pass <= passBackoffMs.length; pass++) {
-    for (const base of providerOrder()) {
+    for (const lane of laneOrder()) {
       try {
-        const { email, mailJwt } = await createMailboxOn(base);
+        const { email, handle } = await lane.create();
+        if (blockedMailDomains.has(String(email).split("@")[1])) continue;
         const raccoonPassword = generatePassword();
         const sn = generateSN();
         const h = { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Mozilla/5.0 Chrome/147.0.0.0 Safari/537.36" };
         const common = { sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web" };
         let code = null;
-        for (let attempt = 0; attempt < 2 && !code; attempt++) {
-          await raccoonFetch("/users/sendEmail", { method: "POST", headers: h, body: new URLSearchParams({ email, type: "register", ...common }) });
-          try { code = await getVerificationCode(mailJwt, base, 17); } // ~50s per send attempt
-          catch (e) { lastErr = e; }
+        let rejected = null;
+        for (let attempt = 0; attempt < 2 && !code && !rejected; attempt++) {
+          const seRes = await raccoonFetch("/users/sendEmail", { method: "POST", headers: h, body: new URLSearchParams({ email, type: "register", ...common }) });
+          rejected = raccoonRejectedMail(await seRes.json().catch(() => null));
+          if (rejected) break; // refused outright — don't wait for mail
+          code = await pollCode(lane, handle, 17); // ~50s worst case per attempt
         }
-        if (!code) { noteProviderFail(base); continue; }
-        await raccoonFetch("/users/emailRegister", { method: "POST", headers: h, body: new URLSearchParams({ email, code, password: raccoonPassword, phone: "1", country: "Brazil", ...common }) });
+        if (rejected) {
+          markDomainBlocked(email, rejected);
+          noteProviderFail(lane.id, new Error(rejected));
+          lastErr = new Error(`Raccoon refused ${email.split("@")[1]}: ${rejected}`);
+          continue;
+        }
+        if (!code) { lastErr = new Error(`no verification code from ${lane.id}`); noteProviderFail(lane.id, lastErr); continue; }
+        const regRes = await raccoonFetch("/users/emailRegister", { method: "POST", headers: h, body: new URLSearchParams({ email, code, password: raccoonPassword, phone: "1", country: "Brazil", ...common }) });
+        const regRejected = raccoonRejectedMail(await regRes.json().catch(() => null));
+        if (regRejected) {
+          // Registration refused — a blocklisted domain looks exactly like this,
+          // so retire the domain and rotate rather than fail the player.
+          markDomainBlocked(email, regRejected);
+          throw new Error(`register refused: ${regRejected}`);
+        }
         const loginRes = await raccoonFetch("/users/emailLogin", { method: "POST", headers: h, body: new URLSearchParams({ email, password: raccoonPassword, ...common }) });
         const loginData = await parseJson(loginRes, "Raccoon login");
-        if (loginData.status !== 200) { noteProviderFail(base); throw new Error("Login failed"); }
+        if (loginData.status !== 200 && loginData.status !== 201) { noteProviderFail(lane.id, new Error("Login failed")); throw new Error(`Login failed: ${loginData.msg || loginData.status}`); }
         let userToken = loginData.data?.user_token || "";
         const cookie = loginRes.headers.get("set-cookie");
         if (cookie) { const m = cookie.match(/as_user_token=([^;]+)/); if (m) userToken = m[1]; }
-        noteProviderOk(base);
+        if (!userToken) { noteProviderFail(lane.id, new Error("No user token")); throw new Error("Login returned no user token"); }
+        noteProviderOk(lane.id);
         return { sn, token: userToken };
       } catch (e) {
         lastErr = e;
-        noteProviderFail(base);
+        noteProviderFail(lane.id, e);
       }
     }
     if (pass < passBackoffMs.length) {
-      console.log(`account creation failed (${lastErr.message}) — retrying in ${passBackoffMs[pass] / 1000}s`);
+      console.log(`account creation failed (${lastErr ? lastErr.message : "every mail lane is blocklisted"}) — retrying in ${passBackoffMs[pass] / 1000}s`);
       await new Promise((r) => setTimeout(r, passBackoffMs[pass]));
     }
   }
@@ -513,14 +646,14 @@ app.post("/cloud/v1/verifyPro", auth, (req, res) => {
 const REGISTER_HEADERS = { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Mozilla/5.0 Chrome/147.0.0.0 Safari/537.36" };
 function registerBase(sn) { return { sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web" }; }
 
-// Create a temp mailbox for the manual-login path. Pinned to the PRIMARY
-// provider on purpose: the client reads codes via /getCode which polls the
-// primary too, so the mailbox and the poll must agree.
+// Create a mailbox for the manual-login path. The handle it returns is opaque:
+// the client hands it straight back to /getCode, so whichever lane created the
+// mailbox is also the lane that reads it.
 async function createMailbox() {
   let lastErr = null;
-  for (const base of providerOrder()) {
-    try { return await createMailboxOn(base); }
-    catch (e) { lastErr = e; noteProviderFail(base); }
+  for (const lane of laneOrder()) {
+    try { const { email, handle } = await lane.create(); return { email, ...handle }; }
+    catch (e) { lastErr = e; noteProviderFail(lane.id, e); }
   }
   throw lastErr || new Error("No mail provider available");
 }
@@ -532,23 +665,45 @@ app.post("/cloud/v1/createMailbox", auth, async (req, res) => {
 
 // Single-poll read of the newest message's 6-digit code from a mailbox.
 app.post("/cloud/v1/getCode", auth, async (req, res) => {
-  const { mailJwt, base } = req.body;
-  if (!mailJwt) return res.status(400).json({ error: "Missing mailJwt." });
-  const baseUrl = typeof base === "string" && MAIL_PROVIDERS.includes(base) ? base : MAIL_PROVIDERS[0];
-  try {
-    const headers = { Authorization: `Bearer ${mailJwt}`, "Content-Type": "application/json" };
-    const r = await fetchWithTimeout(`${baseUrl}/messages?page=1`, { headers });
-    const data = await parseJson(r, "Mail service");
-    if (data["hydra:member"]?.length > 0) {
-      const msgId = data["hydra:member"][0].id;
-      const full = await parseJson(await fetchWithTimeout(`${baseUrl}/messages/${msgId}`, { headers }), "Mail service");
-      const body = [full.text, ...(Array.isArray(full.html) ? full.html : [full.html])].filter(Boolean).join("\n");
-      const match = body.replace(/<[^>]*>/g, "").match(/\b\d{6}\b/);
-      res.json({ code: match ? match[0] : null });
-    } else {
-      res.json({ code: null });
-    }
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  const body = req.body || {};
+  let lane = null;
+  if (body.lane === "tempmail.lol" && body.mailToken) {
+    lane = tempmailLolLane;
+  } else if (body.lane === "domain" && body.email && domainLane) {
+    lane = domainLane;
+  } else if (body.lane === "mailtm" || (!body.lane && body.mailJwt)) {
+    const base = typeof body.base === "string" && MAIL_PROVIDERS.includes(body.base) ? body.base : MAIL_PROVIDERS[0];
+    lane = mailtmLane(base);
+    body.base = base; // fall back to the primary if the client didn't say which
+  }
+  if (!lane) return res.status(400).json({ error: "Missing mailbox handle." });
+  try { res.json({ code: await lane.read(body) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Inbound mail webhook (own-domain lane) ──────────────────────────────────
+// The Cloudflare Email Worker POSTs every message that lands on
+// GHOSTCLOUD_MAIL_DOMAIN here, so account creation never has to poll. Guarded
+// by GHOSTCLOUD_INBOUND_KEY — the Worker sends it in x-ghostcloud-key.
+const INBOUND_KEY = process.env.GHOSTCLOUD_INBOUND_KEY || "";
+app.post("/cloud/v1/inbound", (req, res) => {
+  if (!INBOUND_KEY) return res.status(503).json({ error: "Inbound mail is not configured on this server." });
+  const key = req.get("x-ghostcloud-key") || req.query.key;
+  if (key !== INBOUND_KEY) return res.status(401).json({ error: "Bad inbound key." });
+  const to = String(req.body?.to || "").trim().toLowerCase();
+  const text = `${req.body?.subject || ""} ${req.body?.text || ""} ${req.body?.html || ""}`.replace(/<[^>]*>/g, " ");
+  const match = text.match(/\b\d{6}\b/);
+  if (to && match) {
+    inboundCodes.set(to, { code: match[0], at: Date.now() });
+    console.log(`inboundMail ${to} → code received`);
+  } else {
+    console.log(`inboundMail ${to || "(no recipient)"} → no code found`);
+  }
+  // Keep the map tiny — these are only read within a minute of arriving.
+  if (inboundCodes.size > 500) {
+    for (const [k, v] of inboundCodes) if (Date.now() - v.at > 30 * 60000) inboundCodes.delete(k);
+  }
+  res.json({ ok: true, stored: Boolean(to && match) });
 });
 
 // Step 1 of manual account creation: user provides their own mailbox,
@@ -822,6 +977,10 @@ setInterval(() => {
 // topping it up so it self-heals the moment the provider recovers — players
 // don't have to eat the per-account creation wait after an outage.
 setInterval(() => { fillPool().catch(() => {}); }, 20000);
+// Provider dashboard: one line at boot, then every 5 min — which mail lane is
+// carrying the site, per-lane ok/fail counts, and whether any lane is skipped.
+console.log(providerDashboard());
+setInterval(() => console.log(providerDashboard()), 5 * 60000);
 
 httpServer.listen(PORT, () => {
   console.log("");
@@ -830,6 +989,7 @@ httpServer.listen(PORT, () => {
   console.log(" port      " + PORT);
   console.log(" sites     " + Object.keys(sites.sites).join(", "));
   console.log(" pool      " + POOL_TARGET + " accounts");
+  console.log(" mail      " + allLanes().map((l) => l.id).join(", "));
   console.log("");
   fillPool().catch(() => {});
 });
